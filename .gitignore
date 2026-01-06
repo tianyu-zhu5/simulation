@@ -2,5 +2,7 @@ out/
 *.mph
 *.log
 *.tmp
+*.asv
+*.m~
 .vscode/
 .idea/
