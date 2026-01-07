@@ -16,16 +16,17 @@ function run_pyramid_array_5x5_rp()
 %   P_eff = |Fz_top| / A_top, where A_top = W*W.
 % - Contact quantities use solid.dcnt1.Tn (single source of truth; explicitly bound to pair pc).
 
-import com.comsol.model.util.*
-
-tpl = fullfile(pwd, 'out', 'pyramid_5x5', 'Pyramid_5x5_Mech.mph');
-if ~exist(tpl, 'file')
-    error('Missing 5x5 template: %s (run build_pyramid_array_5x5_mech first)', tpl);
+outPyramidDir = fullfile(pwd, 'out', 'pyramid_5x5');
+rpFromSimDir = getenv('RP_FROM_SIM_DIR');
+if isempty(strtrim(rpFromSimDir))
+    rpFromSimDir = find_latest_sim_dir(outPyramidDir);
+end
+rpFromSimDir = resolve_path(pwd, rpFromSimDir);
+if isempty(strtrim(rpFromSimDir)) || ~exist(rpFromSimDir, 'dir')
+    error('RP_FROM_SIM_DIR not set and no out/pyramid_5x5/sim_* found.');
 end
 
-[~, ~, proc] = comsol_matlab_connect(); %#ok<ASGLU>
-
-simDir = fullfile(pwd, 'out', 'pyramid_5x5', ['rp_' datestr(now, 'yyyymmdd_HHMMSS')]);
+simDir = fullfile(outPyramidDir, ['rp_' datestr(now, 'yyyymmdd_HHMMSS')]);
 if ~exist(simDir, 'dir')
     mkdir(simDir);
 end
@@ -33,114 +34,76 @@ end
 summaryPath = fullfile(simDir, 'RP_summary.txt');
 rawCsvPath = fullfile(simDir, 'RP_raw.csv');
 interpCsvPath = fullfile(simDir, 'RP_interp.csv');
-outMph = fullfile(simDir, 'Pyramid_5x5_RP_solved.mph');
-
-model = mphload(tpl);
-model.hist.disable();
-
-comp = model.component('comp1');
-solid = comp.physics('solid');
-pc = comp.pair('pc');
-
-% IMPORTANT (per suggestion.md): do NOT prescribe displacement on the contact face.
-% Use top-face displacement control; the builder increases t_rigid to reduce compression strain.
-bnd_rigid_top = solid.feature('bndl1').selection.entities;
-try, solid.feature('disp1').active(false); catch, end
-try, solid.feature('disp_rigid').active(false); catch, end
-
-try
-    solid.feature('disp_top');
-    hasDispTop = true;
-catch
-    hasDispTop = false;
+simMetricsPath = fullfile(rpFromSimDir, 'Pyramid_5x5_metrics.csv');
+simCheckpointPath = fullfile(rpFromSimDir, 'Pyramid_5x5_checkpoint_last_ok.mph');
+if ~exist(simCheckpointPath, 'file')
+    simCheckpointPath = 'NA';
 end
-if ~hasDispTop
-    solid.create('disp_top', 'Displacement2', 2);
+if ~exist(simMetricsPath, 'file')
+    error('Missing mechanical metrics: %s', simMetricsPath);
 end
-solid.feature('disp_top').selection.set(bnd_rigid_top);
-solid.feature('disp_top').set('Direction', {'prescribed','prescribed','prescribed'});
-solid.feature('disp_top').set('U0', {'0','0','-delta'});
-
-% Disable pressure load for this run (we derive P_eff from reaction force).
-try
-    solid.feature('bndl1').set('forceType', 'FollowerPressure');
-    solid.feature('bndl1').set('pressure', '0[Pa]');
-catch
-end
-try, model.param.set('P_load', '0[Pa]'); catch, end
-
-% Mesh: keep template default (the 5x5 model can be very large).
-
-% Study settings
-st = model.study('std1').feature('stat');
-st.set('geometricNonlinearity', 'on');
-try, st.set('geometricNonlinearityActive', 'on'); catch, end
-st.set('useparam', 'off');
-
-% Ensure contact uses cnt1 over pair pc (single source of truth)
-try
-    cnt = solid.feature('cnt1');
-    cnt.set('pairSelection', 'list');
-    cnt.set('pairs', {'pc'});
-    cnt.set('ContactMethodCtrl', 'Penalty');
-    cnt.set('useCutback', 1);
-    cnt.set('useRelaxation', 'Conditional');
-    cnt.set('penaltyCtrl', 'userDefined');
-    cnt.set('pn_penalty', '0.01*solid.cnt1.E_char/solid.hmin_dst');
-    cnt.set('ContactTolType', 'Manual');
-    cnt.set('tolcontact', '1e-6');
-catch
-end
-% Neutralize dcnt1 (it exists by default and cannot be disabled in this COMSOL setup).
-try
-    dcnt0 = solid.feature('dcnt1');
-    dcnt0.set('pairSelection', 'list');
-    dcnt0.set('pairs', javaArray('java.lang.String', 0));
-catch
-end
-
-% Selections
-% Reaction force is taken on the prescribed displacement boundary (plate top).
-bnd_force = bnd_rigid_top;
-bnd_dst = pc.destination.entities;
 
 % Geometry size (SI)
-try
-    W_si = model.param.evaluate('W'); % meters
-catch
-    W_si = 100e-6;
-end
+W_si = 100e-6;
 A_top = W_si * W_si;
 
 % Conductor-A parameters (SI)
-try
-    rhoA = model.param.evaluate('rho_A'); % Ω·m
-catch
-    rhoA = 5e-4;
-end
-try
-    tA = model.param.evaluate('t_cnt'); % meters
-catch
-    tA = 3e-6;
-end
+rhoA = 5e-4;
+tA = 3e-6;
 
 % Target pressure range (Pa)
 Pmin = 0.28e3;
 Pmax = 1.00e3;
 
 fid = fopen(summaryPath, 'w', 'n', 'UTF-8');
-fprintf(fid, "Template: %s\n", tpl);
+fprintf(fid, "rp_from_sim_dir: %s\n", rpFromSimDir);
+fprintf(fid, "sim_metrics_path: %s\n", simMetricsPath);
+fprintf(fid, "sim_checkpoint_path: %s\n", simCheckpointPath);
 fprintf(fid, "W_m: %.6g\n", W_si);
 fprintf(fid, "A_top_m2: %.6g\n", A_top);
 fprintf(fid, "rho_A_Ohm_m: %.6g\n", rhoA);
 fprintf(fid, "t_cnt_m: %.6g\n", tA);
 fprintf(fid, "Assumption: Rc = (rho_A*t_cnt)/Ac; R1=R2=rho_A/t_cnt; R=R1+R2+Rc.\n");
 fprintf(fid, "TargetPressureRange_Pa: [%g, %g]\n", Pmin, Pmax);
-fprintf(fid, "MechanicsNote: plate driven by top-face displacement (bottom contact face not prescribed).\n");
+fprintf(fid, "MechanicsNote: RP reads mechanical outputs from sim metrics (no new mechanical solves).\n");
 fprintf(fid, "\nProgressLog:\n");
 fclose(fid);
 
+% Load mechanical metrics from the specified sim output directory.
+Tsim = readtable(simMetricsPath, 'PreserveVariableNames', true);
+needCols = {'delta_total_um','Fz_plate_top_int_N','Tn_max_Pa','Ac_m2'};
+for iC = 1:numel(needCols)
+    if ~any(strcmp(Tsim.Properties.VariableNames, needCols{iC}))
+        error('sim_metrics missing column: %s', needCols{iC});
+    end
+end
+
+deltaList = Tsim.delta_total_um(:);
+FzTop = Tsim.Fz_plate_top_int_N(:);
+tnMax = Tsim.Tn_max_Pa(:);
+Ac = Tsim.Ac_m2(:);
+P_eff = abs(FzTop) ./ max(A_top, eps);
+
+R1 = rhoA / tA; % Ω (since L=W=100 um)
+R2 = R1;
+rho_c = rhoA * tA; % Ω·m² (assumption A)
+Rc = nan(size(deltaList));
+R = nan(size(deltaList));
+for i = 1:numel(deltaList)
+    if isfinite(Ac(i)) && Ac(i) > 0
+        Rc(i) = rho_c / Ac(i);
+    else
+        Rc(i) = NaN;
+    end
+    R(i) = R1 + R2 + Rc(i);
+end
+
+fid = fopen(summaryPath, 'a', 'n', 'UTF-8');
+fprintf(fid, "  - loaded mechanical metrics rows: %d\n", numel(deltaList));
+fclose(fid);
+
 lastErrorMsg = '';
+if false
 
 % Delta sweep (um). With gap0=1[um], contact typically starts near delta≈1[um].
 % We start a bit below and sweep beyond to cover ~0.28–1.0 kPa via P_eff.
@@ -193,11 +156,12 @@ end
 
 % Save solved model (last state)
 mphsave(model, outMph);
+end
 
 % Write raw CSV (delta-sweep)
 try
     Traw = table(deltaList(:), P_eff(:), FzTop(:), tnMax(:), Ac(:), repmat(R1, numel(deltaList), 1), repmat(R2, numel(deltaList), 1), Rc(:), R(:), ...
-        'VariableNames', {'delta_um','P_eff_Pa','Fz_top_int_N','Tn_max_Pa','Ac_m2','R1_ohm','R2_ohm','Rc_ohm','R_total_ohm'});
+        'VariableNames', {'delta_total_um','P_eff_Pa','Fz_top_int_N','Tn_max_Pa','Ac_m2','R1_ohm','R2_ohm','Rc_ohm','R_total_ohm'});
     writetable(Traw, rawCsvPath);
 catch
 end
@@ -264,27 +228,9 @@ else
     fprintf(fid, "P_eff_coverage_Pa: [NaN, NaN]\n");
 end
 fprintf(fid, "interp_status: %s\n", interpStatus);
-if strlength(string(lastErrorMsg)) > 0
-    fprintf(fid, "last_solve_error: %s\n", lastErrorMsg);
-end
 fprintf(fid, "raw_csv: %s\n", rawCsvPath);
 fprintf(fid, "interp_csv: %s\n", interpCsvPath);
-fprintf(fid, "solved_mph: %s\n", outMph);
 fclose(fid);
-
-ModelUtil.disconnect();
-
-% Best-effort cleanup
-try
-    if ~isempty(proc) && ~proc.HasExited
-        proc.WaitForExit(5000);
-    end
-    if ~isempty(proc) && ~proc.HasExited
-        proc.Kill();
-        proc.WaitForExit();
-    end
-catch
-end
 end
 
 function out = tern(cond, a, b)
@@ -292,5 +238,38 @@ if cond
     out = a;
 else
     out = b;
+end
+end
+
+function dirPath = find_latest_sim_dir(outPyramidDir)
+dirPath = '';
+try
+    d = dir(fullfile(outPyramidDir, 'sim_*'));
+    d = d([d.isdir]);
+    if isempty(d)
+        return;
+    end
+    [~, idx] = sort({d.name});
+    dirPath = fullfile(outPyramidDir, d(idx(end)).name);
+catch
+    dirPath = '';
+end
+end
+
+function p = resolve_path(baseDir, p0)
+p = strtrim(string(p0));
+if p == ""
+    p = "";
+    return;
+end
+pp = char(p);
+if isfolder(pp) || isfile(pp)
+    p = pp;
+    return;
+end
+try
+    p = fullfile(baseDir, pp);
+catch
+    p = pp;
 end
 end

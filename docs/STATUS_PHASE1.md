@@ -198,3 +198,35 @@ Termination note (Phase1.3):
 - Recommend Phase2 minimal upgrades:
   1) Switch contact algorithm preset (e.g., Augmented Lagrange or auto-penalty).
   2) Enable ν stabilization (e.g., ν=0.48 or nearly-incompressible formulation).
+
+## Update (2026-01-07 13:03) — Phase2 resume micro continuation
+Run command:
+- matlab -batch "run_pyramid_array_5x5_sim_runbook"
+
+Output directory:
+- out/pyramid_5x5/sim_20260107_130330/
+
+Key outcomes:
+- RESUME_POST_ONSET_ONLY: true (resume_from_dir=out/pyramid_5x5/sim_20260107_120640/)
+- entered_post_onset_micro: true
+- micro_target attempted: 1.0205 (PTC OK; stationary hit per_solve_timeout)
+- last_success_delta_total_um: 1.0205
+- fail_reason: post_onset budget exhausted before reaching 1.0227 (budget_post_onset_micro_s=300)
+
+Classification:
+- PRIMARY: CONTACT_ONSET_STIFFNESS
+- Evidence: post_onset_micro requires slow PTC convergence; runtime consumed the post budget before reaching 1.0227.
+
+## Update (2026-01-07 13:30) — Phase2 augmented_lagrange, resume micro reached 1.0227
+Run command:
+- matlab -batch "run_pyramid_array_5x5_sim_runbook"
+
+Output directory:
+- out/pyramid_5x5/sim_20260107_133015/
+
+Key outcomes:
+- RESUME_POST_ONSET_ONLY: true (resume_from_dir=out/pyramid_5x5/sim_20260107_130330/)
+- post_skip_stationary: true (PTC-first)
+- last_success_delta_total_um: 1.0227
+- early_exit: true (Reached Phase1 target >=1.0227)
+- fail_reason: none

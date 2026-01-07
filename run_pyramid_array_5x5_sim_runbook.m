@@ -20,6 +20,11 @@ simDir = fullfile(pwd, 'out', 'pyramid_5x5', ['sim_' datestr(now, 'yyyymmdd_HHMM
 if ~exist(simDir, 'dir')
     mkdir(simDir);
 end
+resultsDir = fullfile(pwd, 'results');
+if ~exist(resultsDir, 'dir')
+    mkdir(resultsDir);
+end
+phase2MatrixPath = fullfile(resultsDir, 'phase2_matrix.csv');
 
 summaryPath = fullfile(simDir, 'Pyramid_5x5_summary.txt');
 metricsPath = fullfile(simDir, 'Pyramid_5x5_metrics.csv');
@@ -31,7 +36,36 @@ ptcBridgePath = fullfile(simDir, 'ptc_bridge_results.csv');
 baselineCsvPath = fullfile(pwd, 'baseline_results.csv');
 outMph = fullfile(simDir, 'Pyramid_5x5_solved.mph');
 
-model = mphload(tpl);
+resumePostOnsetOnly = get_env_bool('RESUME_POST_ONSET_ONLY', false);
+resumeFromDir = get_env_or_default('RESUME_FROM_DIR', '');
+checkpointSourceDir = 'none';
+lastSuccessFromMetricsUm = NaN;
+lastFzFromMetricsN = NaN;
+resumeCheckpointPath = '';
+resumeMetricsPath = '';
+if resumePostOnsetOnly
+    resumeFromDir = resolve_path(pwd, resumeFromDir);
+    checkpointSourceDir = resumeFromDir;
+    resumeCheckpointPath = fullfile(resumeFromDir, 'Pyramid_5x5_checkpoint_last_ok.mph');
+    resumeMetricsPath = fullfile(resumeFromDir, 'Pyramid_5x5_metrics.csv');
+    if ~exist(resumeCheckpointPath, 'file')
+        error('RESUME_POST_ONSET_ONLY enabled but missing checkpoint: %s', resumeCheckpointPath);
+    end
+    if ~exist(resumeMetricsPath, 'file')
+        error('RESUME_POST_ONSET_ONLY enabled but missing metrics: %s', resumeMetricsPath);
+    end
+    [lastSuccessFromMetricsUm, lastFzFromMetricsN] = read_last_metrics_delta(resumeMetricsPath);
+    if ~isfinite(lastSuccessFromMetricsUm)
+        error('RESUME_POST_ONSET_ONLY enabled but could not parse last_success from metrics: %s', resumeMetricsPath);
+    end
+    try, copyfile(resumeCheckpointPath, checkpointMph, 'f'); catch, end
+    try, copyfile(resumeMetricsPath, metricsPath, 'f'); catch, end
+end
+modelSource = tpl;
+if resumePostOnsetOnly
+    modelSource = resumeCheckpointPath;
+end
+model = mphload(modelSource);
 model.hist.disable();
 
 comp = model.component('comp1');
@@ -57,10 +91,10 @@ minIndentStepUm = 0.001;
 perSolveTimeoutPreS = 120;
 segmentedMaxStepUmPre = 0.002;
 segmentedMaxStagesPre = 3;
-perSolveTimeoutPostS = 240;
-segmentedMaxStepUmPost = 0.0005;
+perSolveTimeoutPostS = 120;
+segmentedMaxStepUmPost = 0.001;
 segmentedMaxStagesPost = 5;
-globalTimeoutS = 2400;
+globalTimeoutS = 900;
 onsetBridgeMaxGapUm = 0.01;
 preBisectLevels = 2;
 ptcTimeStep = 0.05;
@@ -71,10 +105,32 @@ bridgeDt = 0.05;
 bridgeModeDefault = 'PTC';
 allowRampFallback = false;
 budgetPreOnsetS = 300;
-budgetPostOnsetS = 900;
+budgetPostOnsetS = 300;
 FzEps = 1e-9;
 phase1TargetUm = 1.0227;
 microTargetsUm = [1.0205 1.0210 1.0215 1.0220 1.0223 1.0225 1.0227 1.0230 1.0235 1.0240 1.0250];
+microTargetsUmFull = microTargetsUm;
+if resumePostOnsetOnly && isfinite(lastSuccessFromMetricsUm)
+    microTargetsUm = microTargetsUm(microTargetsUm > lastSuccessFromMetricsUm + 1e-12);
+end
+postSkipStationary = get_env_bool('SIM_POST_SKIP_STATIONARY', false);
+contactMode = get_env_or_default('PHASE2_CONTACT_MODE', 'penalty_soft');
+contactModeRequested = contactMode;
+nuMode = get_env_or_default('PHASE2_NU_MODE', 'prod');
+penaltyFactorMult = str2double(get_env_or_default('PHASE2_PENALTY_FACTOR_MULT', '1.0'));
+if ~isfinite(penaltyFactorMult)
+    penaltyFactorMult = 1.0;
+end
+contactTolScale = str2double(get_env_or_default('PHASE2_CONTACT_TOL_SCALE', '1.0'));
+if ~isfinite(contactTolScale)
+    contactTolScale = 1.0;
+end
+globalTimeoutS = numeric_env('SIM_GLOBAL_TIMEOUT_S', globalTimeoutS);
+perSolveTimeoutPreS = numeric_env('SIM_PER_SOLVE_TIMEOUT_S', perSolveTimeoutPreS);
+perSolveTimeoutPostS = numeric_env('SIM_PER_SOLVE_TIMEOUT_S', perSolveTimeoutPostS);
+budgetPreOnsetS = numeric_env('SIM_BUDGET_PRE_ONSET_S', budgetPreOnsetS);
+budgetPostOnsetS = numeric_env('SIM_BUDGET_POST_ONSET_S', budgetPostOnsetS);
+FzEps = numeric_env('SIM_FZ_EPS_N', FzEps);
 try, model.param.set('delta', '0[um]'); catch, end
 try, model.param.set('P_load', '0[Pa]'); catch, end
 
@@ -83,13 +139,8 @@ try
     cnt = solid.feature('cnt1');
     cnt.set('pairSelection', 'list');
     cnt.set('pairs', {'pc'});
-    cnt.set('ContactMethodCtrl', 'Penalty');
     cnt.set('useCutback', 1);
     cnt.set('useRelaxation', 'Conditional');
-    cnt.set('penaltyCtrl', 'userDefined');
-    cnt.set('pn_penalty', '0.01*solid.cnt1.E_char/solid.hmin_dst');
-    cnt.set('ContactTolType', 'Manual');
-    cnt.set('tolcontact', '1e-6');
 catch
 end
 % Neutralize dcnt1 (it exists by default and cannot be disabled in this COMSOL setup).
@@ -98,6 +149,38 @@ try
     dcnt0.set('pairSelection', 'list');
     dcnt0.set('pairs', javaArray('java.lang.String', 0));
 catch
+end
+
+contactModeSupported = true;
+contactModeEffective = contactMode;
+contactModeNote = 'none';
+try
+    cnt = solid.feature('cnt1');
+    [contactModeSupported, contactModeEffective, contactModeNote] = apply_contact_mode(cnt, contactMode, penaltyFactorMult, contactTolScale);
+catch ME
+    contactModeSupported = false;
+    contactModeNote = string(ME.message);
+end
+
+nuSupported = false;
+nuParamName = '';
+nuValueEffective = NaN;
+nuNote = 'none';
+try
+    [nuSupported, nuParamName, nuValueEffective, nuNote] = apply_nu_mode(model, nuMode);
+catch ME
+    nuSupported = false;
+    nuNote = string(ME.message);
+end
+
+materialTags = {};
+pdmsMaterialTag = '';
+pdmsPropKeys = {};
+materialDiagNote = 'none';
+try
+    [materialTags, pdmsMaterialTag, pdmsPropKeys, materialDiagNote] = collect_material_diagnostics(model);
+catch ME
+    materialDiagNote = string(ME.message);
 end
 
 % Practical continuation trick:
@@ -147,7 +230,9 @@ try, st.set('useinitsol', 'off'); catch, end
 % Mesh: keep the template default (the 5x5 model can be very large).
 % IMPORTANT: explicitly build the mesh and fail fast if meshing is incomplete.
 try
-    comp.mesh('mesh1').run;
+    if ~resumePostOnsetOnly
+        comp.mesh('mesh1').run;
+    end
     ms = mphmeshstats(model);
     if isfield(ms, 'isempty') && ms.isempty
         error('Mesh is empty after mesh1.run().');
@@ -193,7 +278,7 @@ tdAttempted = false;
 tdFailReason = '';
 bridgePolicy = 'PTC>SEGMENTED>TD_RELAX';
 gitCommitHash = get_git_hash();
-deltaPlanMode = 'pre_onset';
+deltaPlanMode = tern(resumePostOnsetOnly, 'post_onset_micro', 'pre_onset');
 contactOnsetDetected = false;
 contactNote = '';
 budgetUsedPre = 0;
@@ -212,12 +297,40 @@ FzPlate = nan(size(deltaTargetsUm));
 targetSolved = false(size(deltaTargetsUm));
 
 fid = fopen(summaryPath, 'w', 'n', 'UTF-8');
+fprintf(fid, "Model_source: %s\n", modelSource);
 fprintf(fid, "Template: %s\n", tpl);
 fprintf(fid, "git_commit_hash: %s\n", gitCommitHash);
 fprintf(fid, "bridge_policy: %s\n", bridgePolicy);
 fprintf(fid, "delta_plan_mode: %s\n", deltaPlanMode);
+fprintf(fid, "resume_post_onset_only: %d\n", resumePostOnsetOnly);
+fprintf(fid, "resume_from_dir: %s\n", string_or_none(resumeFromDir));
+fprintf(fid, "checkpoint_source_dir: %s\n", string_or_none(checkpointSourceDir));
+fprintf(fid, "last_success_from_metrics_um: %s\n", num2str(lastSuccessFromMetricsUm));
 fprintf(fid, "micro_targets: %s\n", mat2str(microTargetsUm));
+fprintf(fid, "micro_targets_full: %s\n", mat2str(microTargetsUmFull));
 fprintf(fid, "Fz_eps: %g\n", FzEps);
+fprintf(fid, "contact_mode_requested: %s\n", contactModeRequested);
+fprintf(fid, "contact_mode: %s\n", contactMode);
+fprintf(fid, "contact_mode_effective: %s\n", contactModeEffective);
+fprintf(fid, "contact_mode_supported: %d\n", contactModeSupported);
+fprintf(fid, "contact_mode_note: %s\n", string_or_none(contactModeNote));
+fprintf(fid, "penalty_factor_mult: %g\n", penaltyFactorMult);
+fprintf(fid, "contact_tolerance_scale: %g\n", contactTolScale);
+fprintf(fid, "nu_mode: %s\n", nuMode);
+fprintf(fid, "nu_value_effective: %g\n", nuValueEffective);
+fprintf(fid, "nu_supported: %d\n", nuSupported);
+fprintf(fid, "nu_note: %s\n", string_or_none(nuNote));
+fprintf(fid, "material_tags: [%s]\n", join_list(materialTags));
+fprintf(fid, "pdms_material_tag: %s\n", string_or_none(pdmsMaterialTag));
+fprintf(fid, "pdms_prop_keys: [%s]\n", join_list(pdmsPropKeys));
+fprintf(fid, "material_diag_note: %s\n", string_or_none(materialDiagNote));
+fprintf(fid, "diag_error: %s\n", tern(strlength(string(materialDiagNote))>0 && string(materialDiagNote)~="none", string(materialDiagNote), "none"));
+if ~nuSupported
+    fprintf(fid, "nu_supported_reason: %s\n", nu_supported_reason(nuNote));
+end
+if ~nuSupported
+    fprintf(fid, "nu_mode_note: model not E-nu based; nu tuning disabled\n");
+end
 try, fprintf(fid, "Lpyr: %s\n", char(model.param.get('Lpyr'))); catch, end
 fprintf(fid, "delta_base_um: %g\n", deltaBaseUm);
 fprintf(fid, "delta_indent_list_um: %s\n", mat2str(deltaIndentUm));
@@ -232,6 +345,7 @@ fprintf(fid, "per_solve_timeout_post_s: %g\n", perSolveTimeoutPostS);
 fprintf(fid, "global_timeout_s: %g\n", globalTimeoutS);
 fprintf(fid, "budget_pre_onset_s: %g\n", budgetPreOnsetS);
 fprintf(fid, "budget_post_onset_micro_s: %g\n", budgetPostOnsetS);
+fprintf(fid, "post_skip_stationary: %d\n", postSkipStationary);
 fprintf(fid, "onset_bridge_max_gap_um: %g\n", onsetBridgeMaxGapUm);
 fprintf(fid, "pre_bisect_levels: %g\n", preBisectLevels);
 fprintf(fid, "segmented_max_step_um_pre: %g\n", segmentedMaxStepUmPre);
@@ -249,7 +363,8 @@ fprintf(fid, "MechanicsNote: plate driven by top-face displacement (bottom conta
 fprintf(fid, "\nProgressLog:\n");
 fclose(fid);
 
-write_metrics_header(metricsPath);
+initialize_metrics_file(metricsPath, resumeMetricsPath, resumePostOnsetOnly);
+cleanupObj = onCleanup(@() finalize_run_files(summaryPath, metricsPath, errorsPath, fallbackReportPath));
 
 % Start from a guaranteed-easy state: delta=0 (no contact), then continue upwards.
 candUm = NaN;
@@ -257,44 +372,63 @@ cntWasActive = false;
 switchToMicro = false;
 lastFzPlate = NaN;
 try
-    try, st.set('useinitsol', 'off'); catch, end
-    model.param.set('delta', '0[um]');
-    try, solid.feature('cnt1').active(false); catch, end
-    fid = fopen(summaryPath, 'a', 'n', 'UTF-8');
-    fprintf(fid, "  - initial solve at delta=0 um (useinitsol=off)\n");
-    fclose(fid);
-t0 = tic;
-model.study('std1').run();
-initialElapsed = toc(t0);
-solveTime = solveTime + initialElapsed;
-[budgetUsedPre, budgetUsedPost] = consume_budget(deltaPlanMode, initialElapsed, budgetUsedPre, budgetUsedPost, budgetPreOnsetS, budgetPostOnsetS);
-hasSol = true;
-prevDeltaUm = 0.0;
-cntWasActive = false;
-deltaHistoryUm(end+1) = 0.0; %#ok<AGROW>
-    fid = fopen(summaryPath, 'a', 'n', 'UTF-8');
-fprintf(fid, "    initial OK at delta=0 um\n");
-fclose(fid);
+    if resumePostOnsetOnly
+        deltaPlanMode = 'post_onset_micro';
+        prevDeltaUm = lastSuccessFromMetricsUm;
+        lastSuccessDeltaUm = lastSuccessFromMetricsUm;
+        lastFzPlate = lastFzFromMetricsN;
+        hasSol = true;
+        cntWasActive = (prevDeltaUm >= cntEnableUm);
+        deltaHistoryUm(end+1) = prevDeltaUm; %#ok<AGROW>
+        fid = fopen(summaryPath, 'a', 'n', 'UTF-8');
+        fprintf(fid, "  - RESUME_POST_ONSET_ONLY enabled; skipping pre_onset and continuing from checkpoint\n");
+        fprintf(fid, "    last_success_from_metrics_um: %.6g\n", lastSuccessFromMetricsUm);
+        fprintf(fid, "    last_success_internal_um: %.6g\n", lastSuccessDeltaUm);
+        fprintf(fid, "    checkpoint_source_dir: %s\n", string_or_none(checkpointSourceDir));
+        fprintf(fid, "    micro_targets_active: %s\n", mat2str(microTargetsUm));
+        fclose(fid);
+        flush_fallback_report(fallbackReportPath, fallbackAttempts, preBisectAttempts, preBisectLastOk, preBisectFail, segmentedAttempts, microTargetAttempts, bridgePolicy, deltaPlanMode, microTargetsUm, budgetUsedPre, budgetUsedPost, budgetPreOnsetS, budgetPostOnsetS, reserveGateTriggered, toc(globalT0), globalTimeoutS - toc(globalT0));
+    else
+        try, st.set('useinitsol', 'off'); catch, end
+        model.param.set('delta', '0[um]');
+        try, solid.feature('cnt1').active(false); catch, end
+        fid = fopen(summaryPath, 'a', 'n', 'UTF-8');
+        fprintf(fid, "  - initial solve at delta=0 um (useinitsol=off)\n");
+        fclose(fid);
+        t0 = tic;
+        model.study('std1').run();
+        initialElapsed = toc(t0);
+        solveTime = solveTime + initialElapsed;
+        [budgetUsedPre, budgetUsedPost] = consume_budget(deltaPlanMode, initialElapsed, budgetUsedPre, budgetUsedPost, budgetPreOnsetS, budgetPostOnsetS);
+        hasSol = true;
+        prevDeltaUm = 0.0;
+        cntWasActive = false;
+        deltaHistoryUm(end+1) = 0.0; %#ok<AGROW>
+        fid = fopen(summaryPath, 'a', 'n', 'UTF-8');
+        fprintf(fid, "    initial OK at delta=0 um\n");
+        fclose(fid);
 
-fallbackAttempts(end+1) = make_attempt('stat', deltaBaseUm, -deltaBaseUm, 0.0, initialElapsed, true, ''); %#ok<AGROW>
+        fallbackAttempts(end+1) = make_attempt('stat', deltaBaseUm, -deltaBaseUm, 0.0, initialElapsed, true, ''); %#ok<AGROW>
+        flush_fallback_report(fallbackReportPath, fallbackAttempts, preBisectAttempts, preBisectLastOk, preBisectFail, segmentedAttempts, microTargetAttempts, bridgePolicy, deltaPlanMode, microTargetsUm, budgetUsedPre, budgetUsedPost, budgetPreOnsetS, budgetPostOnsetS, reserveGateTriggered, toc(globalT0), globalTimeoutS - toc(globalT0));
 
-metrics0 = collect_metrics(model, bnd_rigid_top, bnd_rigid_bot, bnd_eval);
-append_metrics_row(metricsPath, 0.0, deltaBaseUm, metrics0);
-    lastSuccessDeltaUm = 0.0;
-    try, mphsave(model, checkpointMph); catch, end
+        metrics0 = collect_metrics(model, bnd_rigid_top, bnd_rigid_bot, bnd_eval);
+        append_metrics_row(metricsPath, 0.0, deltaBaseUm, metrics0);
+        lastSuccessDeltaUm = 0.0;
+        try, mphsave(model, checkpointMph); catch, end
 
-    % Add a coarse ramp up to the first target to improve robustness.
-    deltaRampUm = unique([0, 0.5*gap0_um, 0.8*gap0_um, gap0_um, cntEnableUm, deltaBaseUm, deltaTargetsUm], 'stable');
+        % Daytime pre-onset targets (skip low deltas).
+        preOnsetTargetsUm = [1.01, 1.015, 1.018, 1.019, 1.0195, 1.01975, 1.02];
+        deltaRampUm = unique([0, preOnsetTargetsUm], 'stable');
 
-    for iT = 1:numel(deltaRampUm)
-        targetUm = deltaRampUm(iT);
-        pending = targetUm; % queue of deltas to solve (midpoints inserted on failure)
-        while ~isempty(pending)
-            candUm = pending(1);
-            stepUm = candUm - prevDeltaUm;
-            if stepUm < 0
-                error('Non-monotone continuation: prev=%g um, cand=%g um', prevDeltaUm, candUm);
-            end
+        for iT = 1:numel(deltaRampUm)
+            targetUm = deltaRampUm(iT);
+            pending = targetUm; % queue of deltas to solve (midpoints inserted on failure)
+            while ~isempty(pending)
+                candUm = pending(1);
+                stepUm = candUm - prevDeltaUm;
+                if stepUm < 0
+                    error('Non-monotone continuation: prev=%g um, cand=%g um', prevDeltaUm, candUm);
+                end
 
         [cntActive, useInit] = prepare_stationary_step(model, solid, st, candUm, cntEnableUm, cntWasActive, hasSol);
 
@@ -328,6 +462,7 @@ append_metrics_row(metricsPath, 0.0, deltaBaseUm, metrics0);
 
         candIndent = candUm - deltaBaseUm;
         fallbackAttempts(end+1) = make_attempt('stat', deltaBaseUm, candIndent, candUm, solveElapsed, ok, errMsg); %#ok<AGROW>
+        flush_fallback_report(fallbackReportPath, fallbackAttempts, preBisectAttempts, preBisectLastOk, preBisectFail, segmentedAttempts, microTargetAttempts, bridgePolicy, deltaPlanMode, microTargetsUm, budgetUsedPre, budgetUsedPost, budgetPreOnsetS, budgetPostOnsetS, reserveGateTriggered, toc(globalT0), globalTimeoutS - toc(globalT0));
 
         if toc(globalT0) > globalTimeoutS
             error('Global timeout exceeded after solve: %.1fs > %.1fs', toc(globalT0), globalTimeoutS);
@@ -428,6 +563,7 @@ append_metrics_row(metricsPath, 0.0, deltaBaseUm, metrics0);
                 end
                 [budgetUsedPre, budgetUsedPost] = consume_budget(deltaPlanMode, elapsedPre, budgetUsedPre, budgetUsedPost, budgetPreOnsetS, budgetPostOnsetS);
                 preBisectAttempts(end+1) = make_pre_bisect_attempt(midUm, okPre, elapsedPre, errPre); %#ok<AGROW>
+                flush_fallback_report(fallbackReportPath, fallbackAttempts, preBisectAttempts, preBisectLastOk, preBisectFail, segmentedAttempts, microTargetAttempts, bridgePolicy, deltaPlanMode, microTargetsUm, budgetUsedPre, budgetUsedPost, budgetPreOnsetS, budgetPostOnsetS, reserveGateTriggered, toc(globalT0), globalTimeoutS - toc(globalT0));
 
                 if okPre
                     fid = fopen(summaryPath, 'a', 'n', 'UTF-8');
@@ -473,10 +609,12 @@ append_metrics_row(metricsPath, 0.0, deltaBaseUm, metrics0);
                     elapsedPreAct = toc(t0);
                     [budgetUsedPre, budgetUsedPost] = consume_budget(deltaPlanMode, elapsedPreAct, budgetUsedPre, budgetUsedPost, budgetPreOnsetS, budgetPostOnsetS);
                     fallbackAttempts(end+1) = make_attempt('pre_activate', deltaBaseUm, preBisectLastOk - deltaBaseUm, preBisectLastOk, elapsedPreAct, true, ''); %#ok<AGROW>
+                    flush_fallback_report(fallbackReportPath, fallbackAttempts, preBisectAttempts, preBisectLastOk, preBisectFail, segmentedAttempts, microTargetAttempts, bridgePolicy, deltaPlanMode, microTargetsUm, budgetUsedPre, budgetUsedPost, budgetPreOnsetS, budgetPostOnsetS, reserveGateTriggered, toc(globalT0), globalTimeoutS - toc(globalT0));
                     cntWasActive = true;
                 catch ME
                     elapsedPreAct = 0;
                     fallbackAttempts(end+1) = make_attempt('pre_activate', deltaBaseUm, preBisectLastOk - deltaBaseUm, preBisectLastOk, elapsedPreAct, false, string(ME.message)); %#ok<AGROW>
+                    flush_fallback_report(fallbackReportPath, fallbackAttempts, preBisectAttempts, preBisectLastOk, preBisectFail, segmentedAttempts, microTargetAttempts, bridgePolicy, deltaPlanMode, microTargetsUm, budgetUsedPre, budgetUsedPost, budgetPreOnsetS, budgetPostOnsetS, reserveGateTriggered, toc(globalT0), globalTimeoutS - toc(globalT0));
                 end
             end
 
@@ -487,7 +625,7 @@ append_metrics_row(metricsPath, 0.0, deltaBaseUm, metrics0);
                 ptcAttempted = true;
                 bridgeAttemptId = bridgeAttemptId + 1;
                 ensure_budget(deltaPlanMode, budgetUsedPre, budgetUsedPost, budgetPreOnsetS, budgetPostOnsetS);
-                [reserveGateTriggered, reserveGateReason] = check_reserve_gate(globalT0, globalTimeoutS, budgetPostOnsetS, reserveGateTriggered, reserveGateReason);
+                [reserveGateTriggered, reserveGateReason] = check_reserve_gate(deltaPlanMode, globalT0, globalTimeoutS, budgetPostOnsetS, reserveGateTriggered, reserveGateReason);
                 if reserveGateTriggered
                     failDeltaUm = preBisectFail;
                     failDeltaIndentUm = preBisectFail - deltaBaseUm;
@@ -497,6 +635,7 @@ append_metrics_row(metricsPath, 0.0, deltaBaseUm, metrics0);
                 [ptcOk, ptcElapsed, ptcErrMsg] = attempt_ptc_bridge(model, solid, st, preBisectLastOk, preBisectFail, cntEnableUm, ptcTimeStep, ptcMaxSteps, ptcDamping, ptcBridgePath, bridgeAttemptId, bnd_eval, bnd_rigid_top);
                 [budgetUsedPre, budgetUsedPost] = consume_budget(deltaPlanMode, ptcElapsed, budgetUsedPre, budgetUsedPost, budgetPreOnsetS, budgetPostOnsetS);
                 fallbackAttempts(end+1) = make_attempt('ptc', deltaBaseUm, preBisectFail - deltaBaseUm, preBisectFail, ptcElapsed, ptcOk, ptcErrMsg); %#ok<AGROW>
+                flush_fallback_report(fallbackReportPath, fallbackAttempts, preBisectAttempts, preBisectLastOk, preBisectFail, segmentedAttempts, microTargetAttempts, bridgePolicy, deltaPlanMode, microTargetsUm, budgetUsedPre, budgetUsedPost, budgetPreOnsetS, budgetPostOnsetS, reserveGateTriggered, toc(globalT0), globalTimeoutS - toc(globalT0));
                 if ptcOk
                     bridgeSuccess = true;
                     fid = fopen(summaryPath, 'a', 'n', 'UTF-8');
@@ -563,7 +702,7 @@ append_metrics_row(metricsPath, 0.0, deltaBaseUm, metrics0);
                     segTarget = segTargets(s);
                     stageId = s - 1;
 
-                    [reserveGateTriggered, reserveGateReason] = check_reserve_gate(globalT0, globalTimeoutS, budgetPostOnsetS, reserveGateTriggered, reserveGateReason);
+                    [reserveGateTriggered, reserveGateReason] = check_reserve_gate(deltaPlanMode, globalT0, globalTimeoutS, budgetPostOnsetS, reserveGateTriggered, reserveGateReason);
                     if reserveGateTriggered
                         failDeltaUm = preBisectFail;
                         failDeltaIndentUm = preBisectFail - deltaBaseUm;
@@ -589,6 +728,7 @@ append_metrics_row(metricsPath, 0.0, deltaBaseUm, metrics0);
                     end
                     [budgetUsedPre, budgetUsedPost] = consume_budget(deltaPlanMode, elapsedSeg, budgetUsedPre, budgetUsedPost, budgetPreOnsetS, budgetPostOnsetS);
                     segmentedAttempts(end+1) = make_segment_attempt(stageId, segTarget, 'stat', okSeg, elapsedSeg, errSeg); %#ok<AGROW>
+                    flush_fallback_report(fallbackReportPath, fallbackAttempts, preBisectAttempts, preBisectLastOk, preBisectFail, segmentedAttempts, microTargetAttempts, bridgePolicy, deltaPlanMode, microTargetsUm, budgetUsedPre, budgetUsedPost, budgetPreOnsetS, budgetPostOnsetS, reserveGateTriggered, toc(globalT0), globalTimeoutS - toc(globalT0));
                     if okSeg
                         fid = fopen(summaryPath, 'a', 'n', 'UTF-8');
                         fprintf(fid, "    segmented OK at delta=%g um\n", segTarget);
@@ -610,7 +750,7 @@ append_metrics_row(metricsPath, 0.0, deltaBaseUm, metrics0);
                     ptcAttempted = true;
                     bridgeAttemptId = bridgeAttemptId + 1;
                     ensure_budget(deltaPlanMode, budgetUsedPre, budgetUsedPost, budgetPreOnsetS, budgetPostOnsetS);
-                    [reserveGateTriggered, reserveGateReason] = check_reserve_gate(globalT0, globalTimeoutS, budgetPostOnsetS, reserveGateTriggered, reserveGateReason);
+                    [reserveGateTriggered, reserveGateReason] = check_reserve_gate(deltaPlanMode, globalT0, globalTimeoutS, budgetPostOnsetS, reserveGateTriggered, reserveGateReason);
                     if reserveGateTriggered
                         failDeltaUm = preBisectFail;
                         failDeltaIndentUm = preBisectFail - deltaBaseUm;
@@ -620,6 +760,7 @@ append_metrics_row(metricsPath, 0.0, deltaBaseUm, metrics0);
                     [ptcOk, ptcElapsed, ptcErrMsg] = attempt_ptc_bridge(model, solid, st, segLastOk, segTarget, cntEnableUm, ptcTimeStep, ptcMaxSteps, ptcDamping, ptcBridgePath, bridgeAttemptId, bnd_eval, bnd_rigid_top);
                     [budgetUsedPre, budgetUsedPost] = consume_budget(deltaPlanMode, ptcElapsed, budgetUsedPre, budgetUsedPost, budgetPreOnsetS, budgetPostOnsetS);
                     segmentedAttempts(end+1) = make_segment_attempt(stageId, segTarget, 'ptc', ptcOk, ptcElapsed, ptcErrMsg); %#ok<AGROW>
+                    flush_fallback_report(fallbackReportPath, fallbackAttempts, preBisectAttempts, preBisectLastOk, preBisectFail, segmentedAttempts, microTargetAttempts, bridgePolicy, deltaPlanMode, microTargetsUm, budgetUsedPre, budgetUsedPost, budgetPreOnsetS, budgetPostOnsetS, reserveGateTriggered, toc(globalT0), globalTimeoutS - toc(globalT0));
                     if ptcOk
                         fid = fopen(summaryPath, 'a', 'n', 'UTF-8');
                         fprintf(fid, "    segmented PTC OK at delta=%g um\n", segTarget);
@@ -678,7 +819,7 @@ append_metrics_row(metricsPath, 0.0, deltaBaseUm, metrics0);
                     bridgeModeUsed = 'TD_RELAX';
                     bridgeAttemptId = bridgeAttemptId + 1;
                     ensure_budget(deltaPlanMode, budgetUsedPre, budgetUsedPost, budgetPreOnsetS, budgetPostOnsetS);
-                    [reserveGateTriggered, reserveGateReason] = check_reserve_gate(globalT0, globalTimeoutS, budgetPostOnsetS, reserveGateTriggered, reserveGateReason);
+                    [reserveGateTriggered, reserveGateReason] = check_reserve_gate(deltaPlanMode, globalT0, globalTimeoutS, budgetPostOnsetS, reserveGateTriggered, reserveGateReason);
                     if reserveGateTriggered
                         failDeltaUm = preBisectFail;
                         failDeltaIndentUm = preBisectFail - deltaBaseUm;
@@ -688,6 +829,7 @@ append_metrics_row(metricsPath, 0.0, deltaBaseUm, metrics0);
                     [tdOk, tdElapsed, tdErrMsg] = attempt_td_bridge('TD_RELAX', model, bnd_rigid_top, bnd_rigid_bot, bnd_eval, segLastOk, preBisectFail, bridgeNT, bridgeDt, tdBridgePath, bridgeAttemptId);
                     [budgetUsedPre, budgetUsedPost] = consume_budget(deltaPlanMode, tdElapsed, budgetUsedPre, budgetUsedPost, budgetPreOnsetS, budgetPostOnsetS);
                     fallbackAttempts(end+1) = make_attempt('td_relax', deltaBaseUm, preBisectFail - deltaBaseUm, preBisectFail, tdElapsed, tdOk, tdErrMsg); %#ok<AGROW>
+                    flush_fallback_report(fallbackReportPath, fallbackAttempts, preBisectAttempts, preBisectLastOk, preBisectFail, segmentedAttempts, microTargetAttempts, bridgePolicy, deltaPlanMode, microTargetsUm, budgetUsedPre, budgetUsedPost, budgetPreOnsetS, budgetPostOnsetS, reserveGateTriggered, toc(globalT0), globalTimeoutS - toc(globalT0));
                     if tdOk
                         bridgeSuccess = true;
                         fid = fopen(summaryPath, 'a', 'n', 'UTF-8');
@@ -763,15 +905,16 @@ append_metrics_row(metricsPath, 0.0, deltaBaseUm, metrics0);
             midIndent = (candIndent + (prevDeltaUm - deltaBaseUm)) / 2;
             midUm = deltaBaseUm + midIndent;
             pending = [midUm, pending]; %#ok<AGROW>
+            end
+            if switchToMicro || earlyExit
+                break;
+            end
         end
         if switchToMicro || earlyExit
             break;
         end
+        end
     end
-    if switchToMicro || earlyExit
-        break;
-    end
-end
     if ~earlyExit && strcmp(deltaPlanMode, 'post_onset_micro')
         fid = fopen(summaryPath, 'a', 'n', 'UTF-8');
         fprintf(fid, "  - switch to post_onset_micro targets\n");
@@ -795,89 +938,98 @@ end
             end
             ensure_budget(deltaPlanMode, budgetUsedPre, budgetUsedPost, budgetPreOnsetS, budgetPostOnsetS);
 
-            [cntActive, useInit] = prepare_stationary_step(model, solid, st, targetUm, cntEnableUm, cntWasActive, hasSol);
-            fid = fopen(summaryPath, 'a', 'n', 'UTF-8');
-            fprintf(fid, "  - post_onset try delta=%g um (useinitsol=%s)\n", targetUm, useInit);
-            fclose(fid);
-
-            t0 = tic;
-            ok = true;
-            errMsg = '';
-            try
-                model.study('std1').run();
-            catch ME
-                ok = false;
-                errMsg = string(ME.message);
-            end
-            elapsed = toc(t0);
-            solveTime = solveTime + elapsed;
-            perSolveTimeoutS = get_per_solve_timeout(deltaPlanMode, perSolveTimeoutPreS, perSolveTimeoutPostS);
-            if elapsed > perSolveTimeoutS
-                ok = false;
-                errMsg = sprintf('per_solve_timeout_s exceeded: %.1fs > %.1fs', elapsed, perSolveTimeoutS);
-            end
-            [budgetUsedPre, budgetUsedPost] = consume_budget(deltaPlanMode, elapsed, budgetUsedPre, budgetUsedPost, budgetPreOnsetS, budgetPostOnsetS);
-            microTargetAttempts(end+1) = make_micro_attempt(targetUm, 'stationary', ok, elapsed, errMsg); %#ok<AGROW>
-            if toc(globalT0) > globalTimeoutS
-                failDeltaUm = targetUm;
-                failDeltaIndentUm = targetUm - deltaBaseUm;
-                failReason = sprintf('Global timeout exceeded after post_onset solve: %.1fs > %.1fs', toc(globalT0), globalTimeoutS);
-                narrowFailIntervalUm = [prevDeltaBefore, targetUm];
-                error('%s', failReason);
-            end
-            if ~ok && strcmp(deltaPlanMode, 'post_onset_micro') && budgetUsedPost > budgetPostOnsetS
-                failDeltaUm = targetUm;
-                failDeltaIndentUm = targetUm - deltaBaseUm;
-                failReason = 'post_onset budget exhausted before reaching 1.0227';
-                narrowFailIntervalUm = [prevDeltaBefore, targetUm];
-                error('post_onset budget exhausted before reaching 1.0227');
-            end
-
-            if ok
+            if ~postSkipStationary
+                [cntActive, useInit] = prepare_stationary_step(model, solid, st, targetUm, cntEnableUm, cntWasActive, hasSol);
                 fid = fopen(summaryPath, 'a', 'n', 'UTF-8');
-                fprintf(fid, "    post_onset OK at delta=%g um\n", targetUm);
+                fprintf(fid, "  - post_onset try delta=%g um (useinitsol=%s)\n", targetUm, useInit);
                 fclose(fid);
 
-                hasSol = true;
-                prevDeltaUm = targetUm;
-                cntWasActive = cntActive;
-                deltaHistoryUm(end+1) = targetUm; %#ok<AGROW>
-                lastSuccessDeltaUm = targetUm;
-                bisectLevelsUsed = 0;
-
-                metrics = collect_metrics(model, bnd_rigid_top, bnd_rigid_bot, bnd_eval);
-                append_metrics_row(metricsPath, targetUm, deltaBaseUm, metrics);
-                try, mphsave(model, checkpointMph); catch, end
-
-                lastFzPlate = metrics.FzPlate;
-                if isfinite(lastFzPlate) && abs(lastFzPlate) > FzEps
-                    contactOnsetDetected = true;
-                    if ~isfinite(metrics.tnMax) || metrics.Ac <= 0
-                        contactNote = 'Force indicates onset but dcnt1 undefined/NaN';
-                    end
+                t0 = tic;
+                ok = true;
+                errMsg = '';
+                try
+                    model.study('std1').run();
+                catch ME
+                    ok = false;
+                    errMsg = string(ME.message);
                 end
-                if strcmp(deltaPlanMode, 'post_onset_micro') && budgetUsedPost > budgetPostOnsetS && lastSuccessDeltaUm < phase1TargetUm
+                elapsed = toc(t0);
+                solveTime = solveTime + elapsed;
+                perSolveTimeoutS = get_per_solve_timeout(deltaPlanMode, perSolveTimeoutPreS, perSolveTimeoutPostS);
+                if elapsed > perSolveTimeoutS
+                    ok = false;
+                    errMsg = sprintf('per_solve_timeout_s exceeded: %.1fs > %.1fs', elapsed, perSolveTimeoutS);
+                end
+                [budgetUsedPre, budgetUsedPost] = consume_budget(deltaPlanMode, elapsed, budgetUsedPre, budgetUsedPost, budgetPreOnsetS, budgetPostOnsetS);
+                microTargetAttempts(end+1) = make_micro_attempt(targetUm, 'stationary', ok, elapsed, errMsg); %#ok<AGROW>
+                flush_fallback_report(fallbackReportPath, fallbackAttempts, preBisectAttempts, preBisectLastOk, preBisectFail, segmentedAttempts, microTargetAttempts, bridgePolicy, deltaPlanMode, microTargetsUm, budgetUsedPre, budgetUsedPost, budgetPreOnsetS, budgetPostOnsetS, reserveGateTriggered, toc(globalT0), globalTimeoutS - toc(globalT0));
+                if toc(globalT0) > globalTimeoutS
+                    failDeltaUm = targetUm;
+                    failDeltaIndentUm = targetUm - deltaBaseUm;
+                    failReason = sprintf('Global timeout exceeded after post_onset solve: %.1fs > %.1fs', toc(globalT0), globalTimeoutS);
+                    narrowFailIntervalUm = [prevDeltaBefore, targetUm];
+                    error('%s', failReason);
+                end
+                if ~ok && strcmp(deltaPlanMode, 'post_onset_micro') && budgetUsedPost > budgetPostOnsetS
                     failDeltaUm = targetUm;
                     failDeltaIndentUm = targetUm - deltaBaseUm;
                     failReason = 'post_onset budget exhausted before reaching 1.0227';
                     narrowFailIntervalUm = [prevDeltaBefore, targetUm];
                     error('post_onset budget exhausted before reaching 1.0227');
                 end
-                if lastSuccessDeltaUm >= phase1TargetUm
-                    earlyExit = true;
-                    earlyExitReason = 'Reached Phase1 target >=1.0227';
-                    break;
+
+                if ok
+                    fid = fopen(summaryPath, 'a', 'n', 'UTF-8');
+                    fprintf(fid, "    post_onset OK at delta=%g um\n", targetUm);
+                    fclose(fid);
+
+                    hasSol = true;
+                    prevDeltaUm = targetUm;
+                    cntWasActive = cntActive;
+                    deltaHistoryUm(end+1) = targetUm; %#ok<AGROW>
+                    lastSuccessDeltaUm = targetUm;
+                    bisectLevelsUsed = 0;
+
+                    metrics = collect_metrics(model, bnd_rigid_top, bnd_rigid_bot, bnd_eval);
+                    append_metrics_row(metricsPath, targetUm, deltaBaseUm, metrics);
+                    try, mphsave(model, checkpointMph); catch, end
+
+                    lastFzPlate = metrics.FzPlate;
+                    if isfinite(lastFzPlate) && abs(lastFzPlate) > FzEps
+                        contactOnsetDetected = true;
+                        if ~isfinite(metrics.tnMax) || metrics.Ac <= 0
+                            contactNote = 'Force indicates onset but dcnt1 undefined/NaN';
+                        end
+                    end
+                    if strcmp(deltaPlanMode, 'post_onset_micro') && budgetUsedPost > budgetPostOnsetS && lastSuccessDeltaUm < phase1TargetUm
+                        failDeltaUm = targetUm;
+                        failDeltaIndentUm = targetUm - deltaBaseUm;
+                        failReason = 'post_onset budget exhausted before reaching 1.0227';
+                        narrowFailIntervalUm = [prevDeltaBefore, targetUm];
+                        error('post_onset budget exhausted before reaching 1.0227');
+                    end
+                    if lastSuccessDeltaUm >= phase1TargetUm
+                        earlyExit = true;
+                        earlyExitReason = 'Reached Phase1 target >=1.0227';
+                        break;
+                    end
+                    continue;
                 end
-                continue;
+            else
+                [~, useInit] = prepare_stationary_step(model, solid, st, targetUm, cntEnableUm, cntWasActive, hasSol);
+                fid = fopen(summaryPath, 'a', 'n', 'UTF-8');
+                fprintf(fid, "  - post_onset try delta=%g um (PTC-first; skip_stationary=on, useinitsol=%s)\n", targetUm, useInit);
+                fclose(fid);
             end
 
-            % Stationary failed -> PTC
+            % post_onset: PTC first (or fallback after stationary fail)
             ptcAttempted = true;
             bridgeAttemptId = bridgeAttemptId + 1;
             ensure_budget(deltaPlanMode, budgetUsedPre, budgetUsedPost, budgetPreOnsetS, budgetPostOnsetS);
             [ptcOk, ptcElapsed, ptcErrMsg] = attempt_ptc_bridge(model, solid, st, prevDeltaUm, targetUm, cntEnableUm, ptcTimeStep, ptcMaxSteps, ptcDamping, ptcBridgePath, bridgeAttemptId, bnd_eval, bnd_rigid_top);
             [budgetUsedPre, budgetUsedPost] = consume_budget(deltaPlanMode, ptcElapsed, budgetUsedPre, budgetUsedPost, budgetPreOnsetS, budgetPostOnsetS);
             microTargetAttempts(end+1) = make_micro_attempt(targetUm, 'PTC', ptcOk, ptcElapsed, ptcErrMsg); %#ok<AGROW>
+            flush_fallback_report(fallbackReportPath, fallbackAttempts, preBisectAttempts, preBisectLastOk, preBisectFail, segmentedAttempts, microTargetAttempts, bridgePolicy, deltaPlanMode, microTargetsUm, budgetUsedPre, budgetUsedPost, budgetPreOnsetS, budgetPostOnsetS, reserveGateTriggered, toc(globalT0), globalTimeoutS - toc(globalT0));
             if toc(globalT0) > globalTimeoutS
                 failDeltaUm = targetUm;
                 failDeltaIndentUm = targetUm - deltaBaseUm;
@@ -1013,6 +1165,7 @@ end
             end
 
             microTargetAttempts(end+1) = make_micro_attempt(targetUm, 'segmented', segOk, segElapsedTotal, segErrMsg); %#ok<AGROW>
+            flush_fallback_report(fallbackReportPath, fallbackAttempts, preBisectAttempts, preBisectLastOk, preBisectFail, segmentedAttempts, microTargetAttempts, bridgePolicy, deltaPlanMode, microTargetsUm, budgetUsedPre, budgetUsedPost, budgetPreOnsetS, budgetPostOnsetS, reserveGateTriggered, toc(globalT0), globalTimeoutS - toc(globalT0));
             if toc(globalT0) > globalTimeoutS
                 failDeltaUm = targetUm;
                 failDeltaIndentUm = targetUm - deltaBaseUm;
@@ -1037,6 +1190,47 @@ end
             end
 
             segmentedFailReason = segErrMsg;
+
+            % TD_RELAX last fallback (avoid consistent-init loops)
+            if ~is_consistent_init_error(segmentedFailReason) && ~is_consistent_init_error(ptcErrMsg)
+                tdAttempted = true;
+                bridgeAttemptId = bridgeAttemptId + 1;
+                ensure_budget(deltaPlanMode, budgetUsedPre, budgetUsedPost, budgetPreOnsetS, budgetPostOnsetS);
+                [reserveGateTriggered, reserveGateReason] = check_reserve_gate(deltaPlanMode, globalT0, globalTimeoutS, budgetPostOnsetS, reserveGateTriggered, reserveGateReason);
+                if reserveGateTriggered
+                    failDeltaUm = targetUm;
+                    failDeltaIndentUm = targetUm - deltaBaseUm;
+                    failReason = reserveGateReason;
+                    narrowFailIntervalUm = [prevDeltaBefore, targetUm];
+                    error('%s', reserveGateReason);
+                end
+                [tdOk, tdElapsed, tdErrMsg] = attempt_td_bridge('TD_RELAX', model, bnd_rigid_top, bnd_rigid_bot, bnd_eval, prevDeltaUm, targetUm, bridgeNT, bridgeDt, tdBridgePath, bridgeAttemptId);
+                [budgetUsedPre, budgetUsedPost] = consume_budget(deltaPlanMode, tdElapsed, budgetUsedPre, budgetUsedPost, budgetPreOnsetS, budgetPostOnsetS);
+                microTargetAttempts(end+1) = make_micro_attempt(targetUm, 'TD_RELAX', tdOk, tdElapsed, tdErrMsg); %#ok<AGROW>
+                flush_fallback_report(fallbackReportPath, fallbackAttempts, preBisectAttempts, preBisectLastOk, preBisectFail, segmentedAttempts, microTargetAttempts, bridgePolicy, deltaPlanMode, microTargetsUm, budgetUsedPre, budgetUsedPost, budgetPreOnsetS, budgetPostOnsetS, reserveGateTriggered, toc(globalT0), globalTimeoutS - toc(globalT0));
+                if tdOk
+                    fid = fopen(summaryPath, 'a', 'n', 'UTF-8');
+                    fprintf(fid, "    post_onset TD_RELAX OK at delta=%g um\n", targetUm);
+                    fclose(fid);
+                    hasSol = true;
+                    prevDeltaUm = targetUm;
+                    cntWasActive = (prevDeltaUm >= cntEnableUm);
+                    deltaHistoryUm(end+1) = targetUm; %#ok<AGROW>
+                    lastSuccessDeltaUm = targetUm;
+                    metrics = collect_metrics(model, bnd_rigid_top, bnd_rigid_bot, bnd_eval);
+                    append_metrics_row(metricsPath, targetUm, deltaBaseUm, metrics);
+                    try, mphsave(model, checkpointMph); catch, end
+                    if lastSuccessDeltaUm >= phase1TargetUm
+                        earlyExit = true;
+                        earlyExitReason = 'Reached Phase1 target >=1.0227';
+                        break;
+                    end
+                    continue;
+                end
+                if is_consistent_init_error(tdErrMsg)
+                    error('td_relax_consistent_init at %.6g um: %s', targetUm, tdErrMsg);
+                end
+            end
             failDeltaUm = targetUm;
             failDeltaIndentUm = targetUm - deltaBaseUm;
             failReason = segErrMsg;
@@ -1051,6 +1245,10 @@ catch ME
         failDeltaIndentUm = candUm - deltaBaseUm;
     end
     failReason = string(ME.message);
+    try
+        write_errors_json(errorsPath, err, deltaBaseUm, failDeltaIndentUm, failDeltaUm, deltaPlanMode, budgetUsedPre, budgetUsedPost, budgetPreOnsetS, budgetPostOnsetS, reserveGateTriggered, toc(globalT0), globalTimeoutS - toc(globalT0));
+    catch
+    end
 end
 
 % Export summary (arrays over target deltas)
@@ -1064,6 +1262,9 @@ fprintf(fid, "Ac_m2: %s\n", mat2str(Ac));
 fprintf(fid, "pn_avg_Pa: %s\n", mat2str(pnAvg));
 fprintf(fid, "Fz_plate_top_int_N: %s\n", mat2str(FzPlate));
 fprintf(fid, "last_success_delta_total_um: %s\n", num2str(lastSuccessDeltaUm));
+fprintf(fid, "last_success_internal_um: %s\n", num2str(lastSuccessDeltaUm));
+fprintf(fid, "last_success_from_metrics_um: %s\n", num2str(lastSuccessFromMetricsUm));
+fprintf(fid, "checkpoint_source_dir: %s\n", string_or_none(checkpointSourceDir));
 fprintf(fid, "fail_delta_total_um: %s\n", num2str(failDeltaUm));
 fprintf(fid, "fail_reason: %s\n", string_or_none(failReason));
 fprintf(fid, "bisect_levels_used: %g\n", bisectLevelsUsed);
@@ -1089,6 +1290,7 @@ fprintf(fid, "budget_used_post_s: %.3f\n", budgetUsedPost);
 fprintf(fid, "time_elapsed_s: %.3f\n", toc(globalT0));
 fprintf(fid, "time_remaining_s: %.3f\n", globalTimeoutS - toc(globalT0));
 fprintf(fid, "reserve_gate_triggered: %d\n", reserveGateTriggered);
+fprintf(fid, "reserve_gate_reason: %s\n", string_or_none(reserveGateReason));
 fprintf(fid, "early_exit: %d\n", earlyExit);
 fprintf(fid, "early_exit_reason: %s\n", string_or_none(earlyExitReason));
 fclose(fid);
@@ -1107,6 +1309,11 @@ if ~isempty(err)
 end
 try
     write_fallback_report(fallbackReportPath, fallbackAttempts, preBisectAttempts, preBisectLastOk, preBisectFail, segmentedAttempts, microTargetAttempts, bridgePolicy, deltaPlanMode, microTargetsUm, budgetUsedPre, budgetUsedPost, budgetPreOnsetS, budgetPostOnsetS, reserveGateTriggered, toc(globalT0), globalTimeoutS - toc(globalT0));
+catch
+end
+try
+    enteredPostOnset = strcmp(deltaPlanMode, 'post_onset_micro') || ~isempty(microTargetAttempts);
+    append_phase2_matrix_row(phase2MatrixPath, contactModeEffective, penaltyFactorMult, nuSupported, enteredPostOnset, lastSuccessDeltaUm, phase1TargetUm, failDeltaUm, failReason, simDir);
 catch
 end
 
@@ -1138,6 +1345,72 @@ if cond
     out = a;
 else
     out = b;
+end
+end
+
+function finalize_run_files(summaryPath, metricsPath, errorsPath, fallbackReportPath)
+try
+    if ~exist(summaryPath, 'file')
+        lastSuccess = NaN;
+        if exist(metricsPath, 'file')
+            try
+                lines = string(readlines(metricsPath));
+                lines = lines(lines ~= "");
+                if numel(lines) > 1
+                    lastLine = lines(end);
+                    parts = strsplit(lastLine, ',');
+                    if numel(parts) >= 2
+                        lastSuccess = str2double(parts{2});
+                    end
+                end
+            catch
+            end
+        end
+        fid = fopen(summaryPath, 'w', 'n', 'UTF-8');
+        fprintf(fid, "summary_note: summary missing; run aborted before finalize\n");
+        fprintf(fid, "last_success_delta_total_um: %g\n", lastSuccess);
+        fprintf(fid, "fail_reason: summary missing; run aborted before finalize\n");
+        fclose(fid);
+    end
+    if ~exist(fallbackReportPath, 'file')
+        payload = struct();
+        payload.timestamp = datestr(now, 'yyyy-mm-ddTHH:MM:SS');
+        payload.note = 'fallback_report missing; run aborted before finalize';
+        txt = jsonencode(payload);
+        fid = fopen(fallbackReportPath, 'w', 'n', 'UTF-8');
+        fprintf(fid, '%s', txt);
+        fclose(fid);
+    end
+    if ~exist(errorsPath, 'file')
+        shouldWrite = true;
+        try
+            lines = string(readlines(summaryPath));
+            lines = lines(lines ~= "");
+            fr = lines(startsWith(lines, "fail_reason:"));
+            if ~isempty(fr)
+                if contains(lower(fr(1)), "none")
+                    shouldWrite = false;
+                end
+            else
+                shouldWrite = true;
+            end
+            if any(contains(lines, "summary missing; run aborted before finalize"))
+                shouldWrite = true;
+            end
+        catch
+            shouldWrite = true;
+        end
+        if shouldWrite
+            payload = struct();
+            payload.timestamp = datestr(now, 'yyyy-mm-ddTHH:MM:SS');
+            payload.message = 'errors.json missing; run failed or aborted before errors capture';
+            txt = jsonencode(payload);
+            fid = fopen(errorsPath, 'w', 'n', 'UTF-8');
+            fprintf(fid, '%s', txt);
+            fclose(fid);
+        end
+    end
+catch
 end
 end
 
@@ -1241,6 +1514,320 @@ out = string(val);
 out = replace(out, [",", newline, char(13)], ";");
 out = regexprep(out, '[^ -~]', '');
 out = char(out);
+end
+
+function out = join_list(list)
+out = '';
+try
+    if isstring(list)
+        list = cellstr(list);
+    end
+    if isempty(list)
+        out = '';
+        return;
+    end
+    if iscell(list)
+        out = strjoin(cellfun(@(s) char(string(s)), list, 'UniformOutput', false), ', ');
+    else
+        out = char(string(list));
+    end
+catch
+    out = '';
+end
+end
+
+function out = nu_supported_reason(nuNote)
+out = "nu detection failed";
+try
+    if strlength(string(nuNote)) == 0 || string(nuNote) == "none"
+        out = "nu detection failed";
+        return;
+    end
+    if contains(lower(string(nuNote)), "no nu")
+        out = "model has no nu parameter";
+    else
+        out = "nu detection failed: " + string(nuNote);
+    end
+catch
+end
+end
+
+function append_phase2_matrix_row(path, contactMode, penaltyFactorMult, nuSupported, enteredPostOnset, lastSuccess, targetUm, failDelta, failReason, outDir)
+header = 'timestamp,contact_mode,penalty_factor_mult,nu_supported,entered_post_onset_micro,last_success,fail_delta,fail_reason,out_dir';
+if exist(path, 'file')
+    try
+        fid = fopen(path, 'r', 'n', 'UTF-8');
+        firstLine = fgetl(fid);
+        fclose(fid);
+        if ~ischar(firstLine) || ~strcmp(strtrim(firstLine), header)
+            legacy = fullfile(fileparts(path), ['phase2_matrix_legacy_' datestr(now, 'yyyymmdd_HHMMSS') '.csv']);
+            try, movefile(path, legacy); catch, end
+        end
+    catch
+    end
+end
+if ~exist(path, 'file')
+    fid = fopen(path, 'w', 'n', 'UTF-8');
+    fprintf(fid, '%s\n', header);
+    fclose(fid);
+end
+timestamp = datestr(now, 'yyyy-mm-ddTHH:MM:SS');
+fid = fopen(path, 'a', 'n', 'UTF-8');
+msg = sanitize_csv_text(string_or_none(failReason));
+fprintf(fid, '%s,%s,%.6g,%d,%d,%.6g,%.6g,%s,%s\n', ...
+    timestamp, contactMode, penaltyFactorMult, tern(nuSupported,1,0), tern(enteredPostOnset,1,0), lastSuccess, failDelta, msg, sanitize_csv_text(outDir));
+fclose(fid);
+end
+
+function val = get_env_or_default(name, defaultVal)
+val = getenv(name);
+if isempty(val)
+    val = defaultVal;
+end
+val = strtrim(val);
+if isempty(val)
+    val = defaultVal;
+end
+end
+
+function out = get_env_bool(name, defaultVal)
+val = getenv(name);
+if isempty(val)
+    out = defaultVal;
+    return;
+end
+val = lower(strtrim(val));
+if any(strcmp(val, {'1','true','yes','y','on'}))
+    out = true;
+elseif any(strcmp(val, {'0','false','no','n','off'}))
+    out = false;
+else
+    out = defaultVal;
+end
+end
+
+function out = numeric_env(name, defaultVal)
+val = getenv(name);
+if isempty(val)
+    out = defaultVal;
+    return;
+end
+v = str2double(strtrim(val));
+if isfinite(v)
+    out = v;
+else
+    out = defaultVal;
+end
+end
+
+function p = resolve_path(baseDir, p0)
+p = strtrim(string(p0));
+if p == ""
+    p = "";
+    return;
+end
+pp = char(p);
+if isfolder(pp) || isfile(pp)
+    p = pp;
+    return;
+end
+try
+    p = fullfile(baseDir, pp);
+catch
+    p = pp;
+end
+end
+
+function initialize_metrics_file(metricsPath, resumeMetricsPath, resumeEnabled)
+if resumeEnabled && ~isempty(resumeMetricsPath) && exist(resumeMetricsPath, 'file')
+    try
+        if ~exist(metricsPath, 'file')
+            copyfile(resumeMetricsPath, metricsPath, 'f');
+        end
+    catch
+    end
+end
+if ~exist(metricsPath, 'file')
+    write_metrics_header(metricsPath);
+end
+end
+
+function [lastSuccessUm, lastFzPlateN] = read_last_metrics_delta(metricsPath)
+lastSuccessUm = NaN;
+lastFzPlateN = NaN;
+if ~exist(metricsPath, 'file')
+    return;
+end
+lines = string(readlines(metricsPath));
+lines = lines(lines ~= "");
+if numel(lines) < 2
+    return;
+end
+lastLine = lines(end);
+parts = strsplit(char(lastLine), ',');
+if numel(parts) >= 2
+    lastSuccessUm = str2double(parts{2});
+end
+if numel(parts) >= 8
+    lastFzPlateN = str2double(parts{8});
+end
+end
+
+function [supported, effective, note] = apply_contact_mode(cnt, contactMode, penaltyFactorMult, contactTolScale)
+supported = true;
+effective = contactMode;
+note = 'none';
+mode = lower(strtrim(contactMode));
+try
+    switch mode
+        case 'penalty_soft'
+            cnt.set('ContactMethodCtrl', 'Penalty');
+            cnt.set('penaltyCtrl', 'userDefined');
+            baseExpr = '0.01*solid.cnt1.E_char/solid.hmin_dst';
+            expr = sprintf('%g*(%s)', penaltyFactorMult, baseExpr);
+            cnt.set('pn_penalty', expr);
+        case 'penalty_auto'
+            cnt.set('ContactMethodCtrl', 'Penalty');
+            ok = try_set_penalty_ctrl(cnt, {'automatic','auto','default'});
+            if ~ok
+                supported = false;
+                note = 'not supported: penaltyCtrl auto not available';
+            end
+        case 'augmented_lagrange'
+            ok = try_set_contact_method(cnt, {'AugmentedLagrange','augmentedLagrange','Augmented Lagrange'});
+            if ~ok
+                supported = false;
+                note = 'not supported: augmented lagrange not available';
+            end
+        otherwise
+            supported = false;
+            note = 'unknown contact_mode';
+    end
+    if contactTolScale ~= 1
+        try, cnt.set('ContactTolType', 'Manual'); catch, end
+        try, cnt.set('tolcontact', sprintf('%g', 1e-6 * contactTolScale)); catch, end
+    end
+catch ME
+    supported = false;
+    note = string(ME.message);
+end
+end
+
+function ok = try_set_contact_method(cnt, candidates)
+ok = false;
+for i = 1:numel(candidates)
+    try
+        cnt.set('ContactMethodCtrl', candidates{i});
+        ok = true;
+        return;
+    catch
+    end
+end
+end
+
+function ok = try_set_penalty_ctrl(cnt, candidates)
+ok = false;
+for i = 1:numel(candidates)
+    try
+        cnt.set('penaltyCtrl', candidates{i});
+        ok = true;
+        return;
+    catch
+    end
+end
+end
+
+function [supported, paramName, nuValue, note] = apply_nu_mode(model, nuMode)
+supported = false;
+paramName = '';
+nuValue = NaN;
+note = 'none';
+candidates = {'nu','nu_mat','nu_s','nu_p','poisson','poissons'};
+for i = 1:numel(candidates)
+    try
+        model.param.evaluate(candidates{i});
+        paramName = candidates{i};
+        supported = true;
+        break;
+    catch
+    end
+end
+if ~supported
+    note = 'not supported: no nu parameter';
+    return;
+end
+targetVal = 0.49;
+mode = lower(strtrim(nuMode));
+if strcmp(mode, 'easy')
+    targetVal = 0.48;
+elseif strcmp(mode, 'prod')
+    targetVal = 0.49;
+else
+    note = 'unknown nu_mode';
+end
+try
+    model.param.set(paramName, sprintf('%.4g', targetVal));
+catch ME
+    supported = false;
+    note = string(ME.message);
+    return;
+end
+try
+    nuValue = model.param.evaluate(paramName);
+catch
+    nuValue = targetVal;
+end
+end
+
+function [tags, pdmsTag, propKeys, note] = collect_material_diagnostics(model)
+tags = {};
+pdmsTag = '';
+propKeys = {};
+note = 'none';
+try
+    comp = model.component('comp1');
+    try
+        raw = comp.material.tags;
+        tags = cell(raw);
+        tags = cellfun(@char, tags, 'UniformOutput', false);
+    catch
+        tags = {};
+    end
+    if ~isempty(tags)
+        for i = 1:numel(tags)
+            try
+                mat = comp.material(tags{i});
+                label = '';
+                try, label = char(mat.label); catch, end
+                if contains(lower(tags{i}), 'pdms') || contains(lower(label), 'pdms')
+                    pdmsTag = tags{i};
+                    break;
+                end
+            catch
+            end
+        end
+        if isempty(pdmsTag)
+            pdmsTag = tags{1};
+        end
+    end
+    if ~isempty(pdmsTag)
+        try
+            mat = comp.material(pdmsTag);
+            pg = mat.propertyGroup('def');
+            try
+                rawKeys = pg.getKeys;
+                propKeys = cell(rawKeys);
+                propKeys = cellfun(@char, propKeys, 'UniformOutput', false);
+            catch
+                propKeys = {};
+            end
+        catch ME
+            note = string(ME.message);
+        end
+    end
+catch ME
+    note = string(ME.message);
+end
 end
 
 function attempt = make_attempt(method, deltaBaseUm, deltaIndentUm, deltaTotalUm, elapsedS, ok, errMsg)
@@ -1397,11 +1984,14 @@ else
 end
 end
 
-function [triggered, reason] = check_reserve_gate(globalT0, globalTimeoutS, budgetPostOnsetS, triggered, reason)
+function [triggered, reason] = check_reserve_gate(mode, globalT0, globalTimeoutS, budgetPostOnsetS, triggered, reason)
+if ~strcmp(mode, 'post_onset_micro')
+    return;
+end
 timeRemaining = globalTimeoutS - toc(globalT0);
 if timeRemaining < budgetPostOnsetS
     triggered = true;
-    reason = 'pre_onset time reserve exhausted (preserving post budget)';
+    reason = 'post_onset time reserve exhausted (preserving micro budget)';
 end
 end
 
@@ -1417,6 +2007,8 @@ payload.micro_target_attempts = microTargetAttempts;
 payload.bridge_policy = bridgePolicy;
 payload.delta_plan_mode = deltaPlanMode;
 payload.micro_targets = microTargetsUm;
+payload.post_skip_stationary = get_env_bool('SIM_POST_SKIP_STATIONARY', false);
+payload.ptc_first = payload.post_skip_stationary;
 payload.budget_used_pre_s = budgetUsedPre;
 payload.budget_used_post_s = budgetUsedPost;
 payload.budget_pre_onset_s = budgetPreOnsetS;
@@ -1428,6 +2020,13 @@ txt = jsonencode(payload);
 fid = fopen(path, 'w', 'n', 'UTF-8');
 fprintf(fid, '%s', txt);
 fclose(fid);
+end
+
+function flush_fallback_report(path, attempts, preBisectAttempts, preBisectLastOk, preBisectFail, segmentedAttempts, microTargetAttempts, bridgePolicy, deltaPlanMode, microTargetsUm, budgetUsedPre, budgetUsedPost, budgetPreOnsetS, budgetPostOnsetS, reserveGateTriggered, timeElapsedS, timeRemainingS)
+try
+    write_fallback_report(path, attempts, preBisectAttempts, preBisectLastOk, preBisectFail, segmentedAttempts, microTargetAttempts, bridgePolicy, deltaPlanMode, microTargetsUm, budgetUsedPre, budgetUsedPost, budgetPreOnsetS, budgetPostOnsetS, reserveGateTriggered, timeElapsedS, timeRemainingS);
+catch
+end
 end
 
 function [ok, elapsed, errMsg] = attempt_td_bridge(mode, model, bnd_rigid_top, bnd_rigid_bot, bnd_eval, deltaStartUm, deltaEndUm, bridgeNT, bridgeDt, tdBridgePath, attemptId)
