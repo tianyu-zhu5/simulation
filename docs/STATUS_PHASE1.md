@@ -56,3 +56,145 @@ Key outcomes (from RP_summary.txt):
 ## Notes
 - Phase 1 achieved structured failure artifacts and TD-bridge attempt; the bridge did not cross the onset wall in this run.
 - baseline_results.csv at repo root updated with fail_delta_total_um=1.02 and td_bridge_failed reason for all target deltas.
+
+## Update (2026-01-06 21:44)
+Run command:
+- matlab -batch "run_pyramid_array_5x5_sim_runbook"
+
+Output directory:
+- out/pyramid_5x5/sim_20260106_212833/
+
+Artifacts present:
+- Pyramid_5x5_summary.txt
+- Pyramid_5x5_metrics.csv
+- Pyramid_5x5_checkpoint_last_ok.mph
+- errors.json
+- fallback_report.json
+- ptc_bridge_results.csv
+
+Key outcomes:
+- last_success_delta_total_um: 1.02 (segmented stationary advanced beyond prior fail)
+- fail_delta_total_um: 1.05
+- fail_reason: Global timeout exceeded before solve: 958.3s > 900.0s
+- bridge_policy: PTC>SEGMENTED>TD_RELAX
+- bridge_mode: SEGMENTED (success)
+- ptc_attempted: true (failed with relative step too small)
+- td_attempted: false
+
+Classification:
+- PRIMARY: CONTACT_ONSET_STIFFNESS
+- Evidence: stationary/ptc failures around onset + global timeout before next delta.
+
+## Update (2026-01-06 22:44)
+Run command:
+- matlab -batch "run_pyramid_array_5x5_sim_runbook"
+
+Output directory:
+- out/pyramid_5x5/sim_20260106_224426/
+
+Artifacts present:
+- Pyramid_5x5_summary.txt
+- Pyramid_5x5_metrics.csv
+- Pyramid_5x5_checkpoint_last_ok.mph
+- errors.json
+- fallback_report.json
+- ptc_bridge_results.csv
+
+Key outcomes:
+- last_success_delta_total_um: 1.0205
+- fail_delta_total_um: 1.0205
+- fail_reason: Global timeout exceeded after post_onset segmented: 903.7s > 900.0s
+- delta_plan_mode_final: post_onset_micro (micro targets active, no 1.05 jump)
+- bridge_policy: PTC>SEGMENTED>TD_RELAX
+- ptc_attempted: true
+- segmented_attempted: true
+
+Classification:
+- PRIMARY: CONTACT_ONSET_STIFFNESS
+- Evidence: segmented needed near onset, global timeout hit during post_onset micro continuation.
+
+## Update (2026-01-06 23:11)
+Run command:
+- matlab -batch "run_pyramid_array_5x5_sim_runbook"
+
+Output directory:
+- out/pyramid_5x5/sim_20260106_231141/
+
+Artifacts present:
+- Pyramid_5x5_summary.txt
+- Pyramid_5x5_metrics.csv
+- Pyramid_5x5_checkpoint_last_ok.mph
+- errors.json
+- fallback_report.json
+- ptc_bridge_results.csv
+
+Key outcomes:
+- last_success_delta_total_um: 1.02
+- fail_delta_total_um: 1.0205
+- fail_reason: Global timeout exceeded before post_onset solve: 1082.3s > 900.0s
+- delta_plan_mode_final: post_onset_micro (switch triggered)
+- narrow_fail_interval_um: [1.02, 1.0205]
+- bridge_mode: SEGMENTED (pre-onset)
+
+Classification:
+- PRIMARY: CONTACT_ONSET_STIFFNESS
+- Evidence: segmented/PTC required to reach 1.02; global timeout before first micro target.
+
+## Update (2026-01-06 23:44)
+Run command:
+- matlab -batch "run_pyramid_array_5x5_sim_runbook"
+
+Output directory:
+- out/pyramid_5x5/sim_20260106_234435/
+
+Artifacts present:
+- Pyramid_5x5_summary.txt
+- Pyramid_5x5_metrics.csv
+- Pyramid_5x5_checkpoint_last_ok.mph
+- errors.json
+- fallback_report.json
+- ptc_bridge_results.csv
+
+Key outcomes:
+- last_success_delta_total_um: 1.0202
+- fail_delta_total_um: 1.0205
+- fail_reason: post_onset_micro_failed at 1.0205 um (relative step too small)
+- delta_plan_mode_final: post_onset_micro (entered micro targets)
+- narrow_fail_interval_um: [1.02, 1.0205]
+
+Classification:
+- PRIMARY: CONTACT_ONSET_STIFFNESS
+- Evidence: micro-target segmented at 1.0205 still hit relative step too small.
+
+## Update (2026-01-07 00:11) — Phase1.3 hard budget run
+Run command:
+- matlab -batch "run_pyramid_array_5x5_sim_runbook"
+
+Output directory:
+- out/pyramid_5x5/sim_20260107_001133/
+
+Artifacts present:
+- Pyramid_5x5_summary.txt
+- Pyramid_5x5_metrics.csv
+- Pyramid_5x5_checkpoint_last_ok.mph
+- errors.json
+- fallback_report.json
+- ptc_bridge_results.csv
+- td_bridge_results.csv
+
+Key outcomes:
+- last_success_delta_total_um: 1.0183
+- fail_delta_total_um: 1.02
+- fail_reason: bridge_failed (relative step too small)
+- delta_plan_mode_final: pre_onset (did not reach micro targets)
+- narrow_fail_interval_um: [1.015, 1.02]
+
+Classification:
+- PRIMARY: CONTACT_ONSET_STIFFNESS
+- Evidence: pre-onset segmented/PTC/TD all failed at 1.02; micro targets not reached.
+
+Termination note (Phase1.3):
+- Outcome: post_onset_micro could not reliably advance beyond 1.0205; second run failed to enter micro.
+- Recommend Phase2 minimal upgrades:
+  1) Switch contact algorithm preset (e.g., Augmented Lagrange or auto-penalty).
+  2) Enable ν stabilization (e.g., ν=0.48 or nearly-incompressible formulation).
