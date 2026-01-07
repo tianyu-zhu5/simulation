@@ -8,7 +8,7 @@ Inputs:
   - last_success: `1.0227` (early_exit=true)
   - force at last row (from metrics): `Fz_plate_top_int_N ≈ -5.69067e-06 N`
 - Diagnosis output:
-  - `out/pyramid_5x5/diag_ac_20260107_145138/Ac_diagnose.csv`
+  - `out/pyramid_5x5/diag_ac_20260107_145744/Ac_diagnose.csv`
 
 ### Required checks
 
@@ -62,4 +62,3 @@ Route B: continue pushing delta (only if Route A proves wrong)
   - extend post_onset micro continuation beyond `1.0227` (e.g. `1.03/1.04`) to grow contact area.
 - Validate:
   - mechanical `metrics.csv` contains at least one row where `Ac_m2>0` (under a correct and stable Ac extraction definition).
-

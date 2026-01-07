@@ -139,7 +139,7 @@ try
         row.max = max(v(good));
     end
 catch ME
-    row.error = "mpheval: " + string(ME.message);
+    row.error = "mpheval: " + short_err(ME);
 end
 
 % candidate Ac definition
@@ -147,9 +147,9 @@ try
     row.Ac_candidate_m2 = mphint2(model, sprintf('if(%s%s%g,1,0)', expr, op, thr), 'surface', 'selection', bndSel);
 catch ME
     if row.error == "none"
-        row.error = "mphint2(Ac): " + string(ME.message);
+        row.error = "mphint2(Ac): " + short_err(ME);
     else
-        row.error = row.error + " | mphint2(Ac): " + string(ME.message);
+        row.error = row.error + " | mphint2(Ac): " + short_err(ME);
     end
 end
 end
@@ -207,5 +207,20 @@ s = string(x);
 s = replace(s, """", """""");
 if contains(s, ",") || contains(s, newline) || contains(s, """")
     s = """" + s + """";
+end
+end
+
+function s = short_err(ME)
+try
+    s = string(ME.message);
+catch
+    s = "unknown error";
+end
+s = replace(s, newline, " ");
+s = replace(s, sprintf('\r'), " ");
+s = regexprep(s, '\s+', ' ');
+maxLen = 240;
+if strlength(s) > maxLen
+    s = extractBefore(s, maxLen) + "...";
 end
 end
