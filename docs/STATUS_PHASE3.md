@@ -62,3 +62,24 @@ Route B: continue pushing delta (only if Route A proves wrong)
   - extend post_onset micro continuation beyond `1.0227` (e.g. `1.03/1.04`) to grow contact area.
 - Validate:
   - mechanical `metrics.csv` contains at least one row where `Ac_m2>0` (under a correct and stable Ac extraction definition).
+
+---
+
+## Update (2026-01-07 20:20) — Why `TD_RELAX` can “grind” for a long time + watchdog fail-fast
+
+### Why `TD_RELAX` can run for a long time
+
+Even when a TD bridge is “just relaxation”, COMSOL’s time-dependent solver can still take a long time because:
+- Each time step requires nonlinear iterations with contact constraints; near onset, iterations can be expensive or stall.
+- “Consistent initialization” / DAE initialization can trigger repeated internal attempts before giving up.
+- Our `per_solve_timeout_s` is an **after-the-fact** check (it can only run after `model.study(...).run()` returns), so it cannot interrupt a stuck solve.
+
+### Watchdog guarantees real fail-fast (external kill)
+
+Use `scripts/run_onepoint_watchdog.ps1` to run a single-point continuation with a hard wall-clock timeout:
+- It sets the same env vars as the usual runbook (contact mode / resume dir / single target).
+- If wall-clock exceeds `TimeoutSec`, it force-kills the MATLAB process and the COMSOL mphserver it started, preventing infinite runs.
+
+Recommended single-point stepping:
+- Don’t jump `1.023 -> 1.024` directly by default.
+- Run `1.0235` first; only after success, run `1.0240`.

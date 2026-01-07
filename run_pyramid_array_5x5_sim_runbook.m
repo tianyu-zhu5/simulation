@@ -119,6 +119,16 @@ if ~isempty(strtrim(microTargetsOverride))
     catch
     end
 end
+singleTargetOverride = getenv('SIM_SINGLE_TARGET_UM');
+if ~isempty(strtrim(singleTargetOverride))
+    try
+        ov1 = parse_num_list(singleTargetOverride);
+        if ~isempty(ov1)
+            microTargetsUm = ov1(1);
+        end
+    catch
+    end
+end
 microTargetsUmFull = microTargetsUm;
 if resumePostOnsetOnly && isfinite(lastSuccessFromMetricsUm)
     microTargetsUm = microTargetsUm(microTargetsUm > lastSuccessFromMetricsUm + 1e-12);
@@ -2238,6 +2248,8 @@ catch ME
 end
 
 function configure_td_solver(model, useConsistent)
+tdMaxIter = numeric_env('SIM_TD_MAXITER', 10);
+tdMaxSteps = numeric_env('SIM_TD_MAXSTEPS', 200);
 try
     soltags = cell(model.sol.tags);
 catch
@@ -2261,6 +2273,14 @@ for i = 1:numel(soltags)
             try, feat.set('solnum', 'last'); catch, end
             try, feat.set('timestepping', 'bdf'); catch, end
             try, feat.set('maxorder', '1'); catch, end
+
+            % Hard caps to avoid TD_RELAX "grinding" forever (best-effort across COMSOL versions).
+            try, feat.set('maxiter', tdMaxIter); catch, end
+            try, feat.set('maxit', tdMaxIter); catch, end
+            try, feat.set('maxniter', tdMaxIter); catch, end
+            try, feat.set('maxsteps', tdMaxSteps); catch, end
+            try, feat.set('maxnsteps', tdMaxSteps); catch, end
+            try, feat.set('maxnumsteps', tdMaxSteps); catch, end
         catch
         end
     end
