@@ -83,3 +83,45 @@ Use `scripts/run_onepoint_watchdog.ps1` to run a single-point continuation with 
 Recommended single-point stepping:
 - Don’t jump `1.023 -> 1.024` directly by default.
 - Run `1.0235` first; only after success, run `1.0240`.
+
+---
+
+## Update (2026-01-08) — Long-term fix: dcnt1-only (SolidContact) + correct variable names
+
+### What changed
+
+We are standardizing to **SolidContact `dcnt1` only** and removing/disabling obsolete **Contact `cnt1`**.
+
+Key discovery for this model:
+- The contact fields to postprocess are **unprefixed**:
+  - `solid.Tn`, `solid.incontact`, `solid.gap`
+- `solid.dcnt1.*` can remain **undefined** even when the feature tag is `dcnt1`.
+
+Runbook reference:
+- `docs/RUNBOOK_DCONTACT_ONLY.md`
+
+### Evidence: dcnt1-only diagnosis (undefined resolved)
+
+Diagnosis output:
+- `out/pyramid_5x5/diag_ac_20260108_131619/Ac_diagnose.csv`
+
+Observed:
+- `enforce_ok=true` with `enforce_note=cnt1_removed`
+- `solid.incontact` evaluable and yields non-zero area:
+  - `Ac_candidate_m2 (incontact>0.5) ≈ 2.324e-10`
+- `solid.Tn` evaluable with `max ≈ 2.9345e4 Pa`
+
+This confirms the previous “dcnt1 undefined” issue was a **variable-name mismatch**, not “no contact onset”.
+
+### Regression: minimal single-point solve wall (not improved yet)
+
+Attempted mechanical regression (PTC-only, from last_success=1.0230):
+- `out/pyramid_5x5/sim_20260108_131902/`
+- target: `1.02301`
+- watchdog timeout kill at 900s:
+  - `out/pyramid_5x5/sim_20260108_131902/watchdog_heartbeat.txt` ends with `KILLED ... attempt_mode=PTC`
+  - `out/pyramid_5x5/sim_20260108_131902/fallback_report.json` stayed at `status=STARTED`
+
+Conclusion:
+- Undefined contact fields is fixed (dcnt1-only + `solid.*` fields).
+- The `1.0230+` wall remains a real convergence/runtime issue.

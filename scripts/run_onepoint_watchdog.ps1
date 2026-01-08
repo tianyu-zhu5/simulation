@@ -121,8 +121,8 @@ $env:SIM_SINGLE_TARGET_UM = [string]$SingleTargetUm
 $env:SIM_MICRO_TARGETS_UM = [string]$SingleTargetUm
 
 # Keep TD_RELAX as last fallback, but limit solver work to avoid "grinding" forever.
-$env:SIM_TD_MAXITER = "10"
-$env:SIM_TD_MAXSTEPS = "200"
+if ([string]::IsNullOrWhiteSpace($env:SIM_TD_MAXITER)) { $env:SIM_TD_MAXITER = "10" }
+if ([string]::IsNullOrWhiteSpace($env:SIM_TD_MAXSTEPS)) { $env:SIM_TD_MAXSTEPS = "200" }
 
 $args = @("-batch", "run_pyramid_array_5x5_sim_runbook")
 Write-Host ("Launching: matlab {0}" -f ($args -join " "))

@@ -2,7 +2,8 @@ function run_pyramid_array_5x5_sim_runbook()
 %RUN_PYRAMID_ARRAY_5X5_SIM_RUNBOOK Solve the 5x5 pyramid array model using the RUNBOOK strategy.
 %
 % Strategy (see RUNBOOK_PYRAMID_SOLVE.md + suggestion.md):
-% - Use a single Solid Mechanics contact feature cnt1 (Contact) explicitly bound to contact pair pc
+% - Long-term path: use SolidContact (dcnt1) only, explicitly bound to contact pair pc
+% - Disable/remove obsolete Contact (cnt1)
 % - Use displacement-control (Displacement2) on the upper plate, with continuation in delta
 % - Enable geometric nonlinearity explicitly
 % - Export minimal summary metrics and save solved MPH
@@ -35,6 +36,9 @@ tdBridgePath = fullfile(simDir, 'td_bridge_results.csv');
 ptcBridgePath = fullfile(simDir, 'ptc_bridge_results.csv');
 baselineCsvPath = fullfile(pwd, 'baseline_results.csv');
 outMph = fullfile(simDir, 'Pyramid_5x5_solved.mph');
+
+% Ensure we always flush minimal artifacts even if we fail early (e.g. mesh build).
+cleanupObj = onCleanup(@() finalize_run_files(summaryPath, metricsPath, errorsPath, fallbackReportPath)); %#ok<NASGU>
 
 resumePostOnsetOnly = get_env_bool('RESUME_POST_ONSET_ONLY', false);
 resumeFromDir = get_env_or_default('RESUME_FROM_DIR', '');
@@ -74,6 +78,29 @@ solid = comp.physics('solid');
 % Representative geometry (keep Lpyr fixed for now; sweep later)
 try, model.param.set('Lpyr', '10[um]'); catch, end
 
+% Phase3.5-A: increase tip truncation (geometry-only).
+% Apply even in RESUME mode; if rat_tip changes, rebuild geometry to keep model consistent.
+ratTipWanted = numeric_env('SIM_RAT_TIP', NaN);
+if ~isfinite(ratTipWanted)
+    ratTipWanted = 0.25;
+end
+ratTipPrev = NaN;
+try, ratTipPrev = model.param.evaluate('rat_tip'); catch, end
+ratTipChanged = false;
+ratTipGeomRebuilt = false;
+if isfinite(ratTipPrev) && abs(ratTipPrev - ratTipWanted) > 1e-12
+    ratTipChanged = true;
+end
+try, model.param.set('rat_tip', sprintf('%.6g', ratTipWanted)); catch, end
+if ratTipChanged
+    try
+        comp.geom('geom1').run;
+        ratTipGeomRebuilt = true;
+    catch
+        ratTipGeomRebuilt = false;
+    end
+end
+
 % Use displacement-control continuation in delta (um), with adaptive step subdivision.
 % NOTE: With gap0=1[um], contact starts near delta≈1[um]. We therefore solve a baseline
 % delta that engages contact, then apply indentation steps on top of that baseline.
@@ -102,6 +129,8 @@ ptcMaxSteps = 50;
 ptcDamping = 0.5;
 bridgeNT = 25;
 bridgeDt = 0.05;
+tdMaxIterEffective = numeric_env('SIM_TD_MAXITER', 10);
+tdMaxStepsEffective = numeric_env('SIM_TD_MAXSTEPS', 200);
 bridgeModeDefault = 'PTC';
 allowRampFallback = false;
 budgetPreOnsetS = 300;
@@ -129,8 +158,12 @@ if ~isempty(strtrim(singleTargetOverride))
     catch
     end
 end
+singleTargetMode = ~isempty(strtrim(singleTargetOverride));
 microTargetsUmFull = microTargetsUm;
-if resumePostOnsetOnly && isfinite(lastSuccessFromMetricsUm)
+% In RESUME_POST_ONSET_ONLY single-target mode we may intentionally sample a point
+% below the last_success (to add RP points in the solvable interval). Do not
+% filter such a target out.
+if resumePostOnsetOnly && isfinite(lastSuccessFromMetricsUm) && ~singleTargetMode
     microTargetsUm = microTargetsUm(microTargetsUm > lastSuccessFromMetricsUm + 1e-12);
 end
 earlyExitTargetUm = phase1TargetUm;
@@ -138,6 +171,23 @@ if resumePostOnsetOnly && isfinite(lastSuccessFromMetricsUm) && lastSuccessFromM
     earlyExitTargetUm = max(microTargetsUmFull);
 end
 postSkipStationary = get_env_bool('SIM_POST_SKIP_STATIONARY', false);
+disableTdRelax = get_env_bool('SIM_DISABLE_TD_RELAX', false);
+disableSegmented = get_env_bool('SIM_DISABLE_SEGMENTED', false);
+localMeshFactor = numeric_env('SIM_LOCAL_MESH_FACTOR', 1);
+localMeshEnabled = isfinite(localMeshFactor) && localMeshFactor > 1;
+selectionBoundaryCount = NaN;
+localMeshBoundaryCountAfterFilter = NaN;
+localMeshZWindowUm = numeric_env('SIM_Z_WINDOW_UM', 2.5);
+localMeshHGrad = numeric_env('SIM_LOCAL_HGRAD', 1.2);
+localMeshMinToMax = numeric_env('SIM_LOCAL_MIN_TO_MAX', 0.2); % min = max * 0.2 => max/5
+localMeshMaxSizeM = NaN;
+localMeshMinSizeM = NaN;
+localMeshZTopUm = NaN;
+localMeshZThresholdUm = NaN;
+meshMinQuality = NaN;
+meshInvertedElements = NaN;
+meshCountQualLt0p1 = NaN;
+meshCountQualLt0p01 = NaN;
 contactMode = get_env_or_default('PHASE2_CONTACT_MODE', 'penalty_soft');
 contactModeRequested = contactMode;
 nuMode = get_env_or_default('PHASE2_NU_MODE', 'prod');
@@ -154,33 +204,35 @@ perSolveTimeoutPreS = numeric_env('SIM_PER_SOLVE_TIMEOUT_S', perSolveTimeoutPreS
 perSolveTimeoutPostS = numeric_env('SIM_PER_SOLVE_TIMEOUT_S', perSolveTimeoutPostS);
 budgetPreOnsetS = numeric_env('SIM_BUDGET_PRE_ONSET_S', budgetPreOnsetS);
 budgetPostOnsetS = numeric_env('SIM_BUDGET_POST_ONSET_S', budgetPostOnsetS);
+segmentedMaxStepUmPost = numeric_env('SIM_SEG_MAX_STEP_UM', segmentedMaxStepUmPost);
+segStagesOverride = numeric_env('SIM_SEG_MAX_STAGES', NaN);
+if isfinite(segStagesOverride)
+    segmentedMaxStagesPost = max(1, round(segStagesOverride));
+end
+tdDtOverride = numeric_env('SIM_TD_DT', NaN);
+if isfinite(tdDtOverride) && tdDtOverride > 0
+    bridgeDt = tdDtOverride;
+end
 FzEps = numeric_env('SIM_FZ_EPS_N', FzEps);
 try, model.param.set('delta', '0[um]'); catch, end
 try, model.param.set('P_load', '0[Pa]'); catch, end
 
-% Ensure contact uses cnt1 over pair pc (single source of truth)
+% Long-term: enforce dcnt1-only and bind explicitly to pair pc.
+dcntOnlyOk = false;
+dcntOnlyNote = 'none';
 try
-    cnt = solid.feature('cnt1');
-    cnt.set('pairSelection', 'list');
-    cnt.set('pairs', {'pc'});
-    cnt.set('useCutback', 1);
-    cnt.set('useRelaxation', 'Conditional');
-catch
-end
-% Neutralize dcnt1 (it exists by default and cannot be disabled in this COMSOL setup).
-try
-    dcnt0 = solid.feature('dcnt1');
-    dcnt0.set('pairSelection', 'list');
-    dcnt0.set('pairs', javaArray('java.lang.String', 0));
-catch
+    [dcntOnlyOk, dcntOnlyNote] = enforce_dcnt1_only(solid, 'dcnt1', 'cnt1', 'pc');
+catch ME
+    dcntOnlyOk = false;
+    dcntOnlyNote = string(ME.message);
 end
 
 contactModeSupported = true;
 contactModeEffective = contactMode;
 contactModeNote = 'none';
 try
-    cnt = solid.feature('cnt1');
-    [contactModeSupported, contactModeEffective, contactModeNote] = apply_contact_mode(cnt, contactMode, penaltyFactorMult, contactTolScale);
+    dcnt = solid.feature('dcnt1');
+    [contactModeSupported, contactModeEffective, contactModeNote] = apply_contact_mode(dcnt, 'dcnt1', contactMode, penaltyFactorMult, contactTolScale);
 catch ME
     contactModeSupported = false;
     contactModeNote = string(ME.message);
@@ -209,7 +261,7 @@ end
 
 % Practical continuation trick:
 % keep contact disabled during the initial approach, then enable it slightly after first touch.
-% (cnt1 can be hard to initialize when enabled too early with a positive gap.)
+% (dcnt1 can be hard to initialize when enabled too early with a positive gap.)
 cntEnableUm = gap0_um + 0.02;
 
 % Pressure load off (keep node but zero it)
@@ -226,6 +278,8 @@ end
 pc = model.component('comp1').pair('pc');
 bnd_rigid_top = solid.feature('bndl1').selection.entities;
 bnd_rigid_bot = pc.source.entities;
+bnd_eval = pc.destination.entities;
+try, selectionBoundaryCount = numel(bnd_eval); catch, selectionBoundaryCount = NaN; end
 try, solid.feature('disp1').active(false); catch, end
 try, solid.feature('disp_rigid').active(false); catch, end
 
@@ -251,26 +305,107 @@ try, st.set('initmethod', 'sol'); catch, end
 try, st.set('initsol', 'current'); catch, end
 try, st.set('useinitsol', 'off'); catch, end
 
+% Pre-mesh summary (so mesh failures still leave a readable summary with local-mesh config).
+try
+    fid0 = fopen(summaryPath, 'w', 'n', 'UTF-8');
+    fprintf(fid0, "summary_stage: PRE_MESH\n");
+    fprintf(fid0, "Model_source: %s\n", string(modelSource));
+    fprintf(fid0, "resume_post_onset_only: %d\n", resumePostOnsetOnly);
+    fprintf(fid0, "resume_from_dir: %s\n", string_or_none(resumeFromDir));
+    fprintf(fid0, "checkpoint_source_dir: %s\n", string_or_none(checkpointSourceDir));
+    fprintf(fid0, "rat_tip_prev: %s\n", num2str(ratTipPrev));
+    fprintf(fid0, "rat_tip_wanted: %s\n", num2str(ratTipWanted));
+    fprintf(fid0, "rat_tip_changed: %d\n", ratTipChanged);
+    fprintf(fid0, "rat_tip_geom_rebuilt: %d\n", ratTipGeomRebuilt);
+    fprintf(fid0, "local_mesh_enabled: %d\n", localMeshEnabled);
+    fprintf(fid0, "local_mesh_factor: %g\n", localMeshFactor);
+    fprintf(fid0, "local_mesh_z_window_um: %g\n", localMeshZWindowUm);
+    fprintf(fid0, "selection_boundary_count: %s\n", num2str(selectionBoundaryCount));
+    fclose(fid0);
+catch
+end
+
+% Mesh controls:
+% - Global mesh1.autoMeshSize(3) remains as in the template (do not override here).
+% - Optionally refine locally on the contact destination boundaries via a filtered subset
+%   of pc.destination.entities (centroid_z filter in a z-window near the pyramid tips).
+
 % Mesh: keep the template default (the 5x5 model can be very large).
 % IMPORTANT: explicitly build the mesh and fail fast if meshing is incomplete.
+meshHasProblems = false;
+meshProblemsNote = 'none';
 try
-    if ~resumePostOnsetOnly
-        comp.mesh('mesh1').run;
-    end
+    if ~resumePostOnsetOnly || ratTipChanged || localMeshEnabled
+        if localMeshEnabled
+            % Base mesh run first (required to evaluate centroid_z integrals robustly).
+            comp.mesh('mesh1').run;
+
+            % Filter the refined boundary set: only boundaries within z_window from the topmost centroid.
+            try
+                [bndFiltered, localMeshZTopUm, localMeshZThresholdUm] = filter_boundaries_by_centroid_z(model, bnd_eval, localMeshZWindowUm);
+                localMeshBoundaryCountAfterFilter = numel(bndFiltered);
+            catch
+                bndFiltered = [];
+                localMeshBoundaryCountAfterFilter = 0;
+            end
+            if isempty(bndFiltered)
+                error('Local mesh enabled but boundary filter produced empty selection (z_window_um=%g).', localMeshZWindowUm);
+            end
+
+	            % Configure local mesh sizing on the filtered selection (quality-first settings).
+	            try
+	                msBase = mphmeshstats(model);
+	                [globalHmaxM, globalHminM] = extract_mesh_hmax_hmin(msBase);
+	                % Quality-first sizing: prefer explicit hmax/hmin to avoid pathological size behavior.
+	                if isfinite(globalHmaxM)
+	                    localMeshMaxSizeM = globalHmaxM / localMeshFactor;
+	                else
+	                    % Fallback: derive a conservative absolute size from the z-window.
+	                    localMeshMaxSizeM = max(0.3e-6, (localMeshZWindowUm * 1e-6) / localMeshFactor);
+	                end
+	                localMeshMinSizeM = localMeshMaxSizeM * localMeshMinToMax;
+	                if ~isfinite(localMeshHGrad)
+	                    localMeshHGrad = 1.2;
+	                end
+	                localMeshHGrad = min(localMeshHGrad, 1.2);
+
+	                mesh1 = comp.mesh('mesh1');
+	                rebuild_mesh_with_local_size(mesh1, bndFiltered, localMeshHGrad, localMeshMaxSizeM, localMeshMinSizeM);
+	                comp.mesh('mesh1').run;
+	            catch ME2
+	                error('Local mesh configuration failed: %s', string(ME2.message));
+	            end
+	        else
+	            comp.mesh('mesh1').run;
+	        end
+	    end
     ms = mphmeshstats(model);
     if isfield(ms, 'isempty') && ms.isempty
         error('Mesh is empty after mesh1.run().');
     end
-    if isfield(ms, 'hasproblems') && ms.hasproblems
-        error('Mesh has problems after mesh1.run().');
-    end
-catch ME
-    error('Mesh build failed: %s', string(ME.message));
-end
+	    if isfield(ms, 'hasproblems') && ms.hasproblems
+	        meshHasProblems = true;
+	        try
+	            if isfield(ms, 'problemtext')
+	                meshProblemsNote = string(ms.problemtext);
+            elseif isfield(ms, 'problems')
+                meshProblemsNote = string(ms.problems);
+            else
+                meshProblemsNote = 'mesh hasproblems=true (details unavailable)';
+            end
+	        catch
+	            meshProblemsNote = 'mesh hasproblems=true (details parse failed)';
+	        end
+	        [meshMinQuality, meshInvertedElements] = extract_mesh_quality(ms);
+	        [meshCountQualLt0p1, meshCountQualLt0p01] = extract_mesh_quality_counts(ms);
+	    end
+	catch ME
+	    error('Mesh build failed: %s', string(ME.message));
+	end
 
 % Solve via continuation
 % Evaluate contact quantities on the contact destination boundaries.
-bnd_eval = pc.destination.entities;
+% (bnd_eval already computed earlier from pc.destination.entities)
 
 solveTime = 0;
 hasSol = false;
@@ -359,6 +494,26 @@ end
 if ~nuSupported
     fprintf(fid, "nu_mode_note: model not E-nu based; nu tuning disabled\n");
 end
+fprintf(fid, "rat_tip_prev: %s\n", num2str(ratTipPrev));
+fprintf(fid, "rat_tip_wanted: %s\n", num2str(ratTipWanted));
+fprintf(fid, "rat_tip_changed: %d\n", ratTipChanged);
+fprintf(fid, "rat_tip_geom_rebuilt: %d\n", ratTipGeomRebuilt);
+fprintf(fid, "local_mesh_enabled: %d\n", localMeshEnabled);
+fprintf(fid, "local_mesh_factor: %g\n", localMeshFactor);
+fprintf(fid, "selection_boundary_count: %s\n", num2str(selectionBoundaryCount));
+fprintf(fid, "local_mesh_boundary_count_after_filter: %s\n", num2str(localMeshBoundaryCountAfterFilter));
+fprintf(fid, "local_mesh_z_window_um: %g\n", localMeshZWindowUm);
+fprintf(fid, "local_mesh_z_top_um: %s\n", num2str(localMeshZTopUm));
+fprintf(fid, "local_mesh_z_threshold_um: %s\n", num2str(localMeshZThresholdUm));
+fprintf(fid, "local_mesh_growth_rate: %g\n", localMeshHGrad);
+fprintf(fid, "local_mesh_hmax_m: %s\n", num2str(localMeshMaxSizeM));
+fprintf(fid, "local_mesh_hmin_m: %s\n", num2str(localMeshMinSizeM));
+fprintf(fid, "mesh_hasproblems: %d\n", meshHasProblems);
+fprintf(fid, "mesh_problems_note: %s\n", string_or_none(meshProblemsNote));
+fprintf(fid, "mesh_min_quality: %s\n", num2str(meshMinQuality));
+fprintf(fid, "mesh_inverted_elements: %s\n", num2str(meshInvertedElements));
+fprintf(fid, "mesh_count_quality_lt_0_1: %s\n", num2str(meshCountQualLt0p1));
+fprintf(fid, "mesh_count_quality_lt_0_01: %s\n", num2str(meshCountQualLt0p01));
 try, fprintf(fid, "Lpyr: %s\n", char(model.param.get('Lpyr'))); catch, end
 fprintf(fid, "delta_base_um: %g\n", deltaBaseUm);
 fprintf(fid, "delta_indent_list_um: %s\n", mat2str(deltaIndentUm));
@@ -375,6 +530,10 @@ fprintf(fid, "budget_pre_onset_s: %g\n", budgetPreOnsetS);
 fprintf(fid, "budget_post_onset_micro_s: %g\n", budgetPostOnsetS);
 fprintf(fid, "early_exit_target_um: %g\n", earlyExitTargetUm);
 fprintf(fid, "post_skip_stationary: %d\n", postSkipStationary);
+fprintf(fid, "disable_td_relax: %d\n", disableTdRelax);
+fprintf(fid, "disable_segmented: %d\n", disableSegmented);
+ptcOnlyMode = resumePostOnsetOnly && singleTargetMode && disableSegmented && disableTdRelax;
+fprintf(fid, "ptc_only_mode: %d\n", ptcOnlyMode);
 fprintf(fid, "onset_bridge_max_gap_um: %g\n", onsetBridgeMaxGapUm);
 fprintf(fid, "pre_bisect_levels: %g\n", preBisectLevels);
 fprintf(fid, "segmented_max_step_um_pre: %g\n", segmentedMaxStepUmPre);
@@ -387,13 +546,28 @@ fprintf(fid, "ptc_damping: %g\n", ptcDamping);
 fprintf(fid, "bridge_mode_default: %s\n", bridgeModeDefault);
 fprintf(fid, "bridgeNT: %g\n", bridgeNT);
 fprintf(fid, "bridgeDt: %g\n", bridgeDt);
+fprintf(fid, "td_maxiter: %g\n", tdMaxIterEffective);
+fprintf(fid, "td_maxsteps: %g\n", tdMaxStepsEffective);
 fprintf(fid, "allow_ramp_fallback: %d\n", allowRampFallback);
 fprintf(fid, "MechanicsNote: plate driven by top-face displacement (bottom contact face not prescribed).\n");
 fprintf(fid, "\nProgressLog:\n");
 fclose(fid);
 
 initialize_metrics_file(metricsPath, resumeMetricsPath, resumePostOnsetOnly);
-cleanupObj = onCleanup(@() finalize_run_files(summaryPath, metricsPath, errorsPath, fallbackReportPath));
+meshWarningContinue = 0;
+if meshHasProblems
+    if isfinite(meshInvertedElements) && meshInvertedElements > 0
+        error('Mesh has inverted elements. Aborting before solve. mesh_min_quality=%s; mesh_inverted_elements=%s', num2str(meshMinQuality), num2str(meshInvertedElements));
+    end
+    if isfinite(meshMinQuality) && meshMinQuality < 0.10
+        error('Mesh min quality < 0.10. Aborting before solve. mesh_min_quality=%s; mesh_inverted_elements=%s', num2str(meshMinQuality), num2str(meshInvertedElements));
+    end
+    meshWarningContinue = 1;
+    fid = fopen(summaryPath, 'a', 'n', 'UTF-8');
+    fprintf(fid, "mesh_warning_continue: %d\n", meshWarningContinue);
+    fprintf(fid, "mesh_warning_note: continuing despite hasproblems=1 (no inverted elems, min_quality>=0.10)\n");
+    fclose(fid);
+end
 
 % Start from a guaranteed-easy state: delta=0 (no contact), then continue upwards.
 candUm = NaN;
@@ -420,7 +594,7 @@ try
     else
         try, st.set('useinitsol', 'off'); catch, end
         model.param.set('delta', '0[um]');
-        try, solid.feature('cnt1').active(false); catch, end
+        try, solid.feature('dcnt1').active(false); catch, end
         fid = fopen(summaryPath, 'a', 'n', 'UTF-8');
         fprintf(fid, "  - initial solve at delta=0 um (useinitsol=off)\n");
         fclose(fid);
@@ -550,7 +724,7 @@ try
                 if isfinite(lastFzPlate) && abs(lastFzPlate) > FzEps
                     contactOnsetDetected = true;
                     if ~isfinite(metrics.tnMax) || metrics.Ac <= 0
-                        contactNote = 'Force indicates onset but dcnt1 undefined/NaN';
+                        contactNote = 'Force indicates onset but dcnt1 metrics invalid (Ac<=0 or NaN)';
                     end
                 end
                 if strcmp(deltaPlanMode, 'pre_onset') && (lastSuccessDeltaUm >= 1.02 || contactOnsetDetected)
@@ -684,7 +858,7 @@ try
                 fclose(fid);
                 try
                     model.param.set('delta', sprintf('%g[um]', preBisectLastOk));
-                    try, solid.feature('cnt1').active(true); catch, end
+                    try, solid.feature('dcnt1').active(true); catch, end
                     try, st.set('useinitsol', 'off'); catch, end
                     [budgetOk, budgetWhy] = ensure_budget(deltaPlanMode, budgetUsedPre, budgetUsedPost, budgetPreOnsetS, budgetPostOnsetS);
                     if ~budgetOk
@@ -762,7 +936,7 @@ try
                     if isfinite(lastFzPlate) && abs(lastFzPlate) > FzEps
                         contactOnsetDetected = true;
                         if ~isfinite(metrics.tnMax) || metrics.Ac <= 0
-                            contactNote = 'Force indicates onset but dcnt1 undefined/NaN';
+                            contactNote = 'Force indicates onset but dcnt1 metrics invalid (Ac<=0 or NaN)';
                         end
                     end
                     if strcmp(deltaPlanMode, 'pre_onset') && (lastSuccessDeltaUm >= 1.02 || contactOnsetDetected)
@@ -916,7 +1090,7 @@ try
                         if isfinite(lastFzPlate) && abs(lastFzPlate) > FzEps
                             contactOnsetDetected = true;
                             if ~isfinite(metrics.tnMax) || metrics.Ac <= 0
-                                contactNote = 'Force indicates onset but dcnt1 undefined/NaN';
+                                contactNote = 'Force indicates onset but dcnt1 metrics invalid (Ac<=0 or NaN)';
                             end
                         end
                     catch
@@ -989,7 +1163,7 @@ try
                         if isfinite(lastFzPlate) && abs(lastFzPlate) > FzEps
                             contactOnsetDetected = true;
                             if ~isfinite(metrics.tnMax) || metrics.Ac <= 0
-                                contactNote = 'Force indicates onset but dcnt1 undefined/NaN';
+                                contactNote = 'Force indicates onset but dcnt1 metrics invalid (Ac<=0 or NaN)';
                             end
                         end
                         if strcmp(deltaPlanMode, 'pre_onset') && (lastSuccessDeltaUm >= 1.02 || contactOnsetDetected)
@@ -1062,7 +1236,9 @@ try
             if earlyExit
                 break;
             end
-            if targetUm <= lastSuccessDeltaUm + 1e-12
+            % In resume single-target mode, allow a "down-step" sampling point
+            % (target <= last_success_from_metrics) instead of skipping it.
+            if ~singleTargetMode && targetUm <= lastSuccessDeltaUm + 1e-12
                 continue;
             end
             prevDeltaBefore = prevDeltaUm;
@@ -1157,7 +1333,7 @@ try
                     if isfinite(lastFzPlate) && abs(lastFzPlate) > FzEps
                         contactOnsetDetected = true;
                         if ~isfinite(metrics.tnMax) || metrics.Ac <= 0
-                            contactNote = 'Force indicates onset but dcnt1 undefined/NaN';
+                            contactNote = 'Force indicates onset but dcnt1 metrics invalid (Ac<=0 or NaN)';
                         end
                     end
                     if strcmp(deltaPlanMode, 'post_onset_micro') && budgetUsedPost > budgetPostOnsetS && lastSuccessDeltaUm < earlyExitTargetUm
@@ -1233,18 +1409,30 @@ try
                 prevDeltaUm = targetUm;
                 cntWasActive = (prevDeltaUm >= cntEnableUm);
                 deltaHistoryUm(end+1) = targetUm; %#ok<AGROW>
-                lastSuccessDeltaUm = targetUm;
+                improved = targetUm >= lastSuccessDeltaUm - 1e-12;
+                if improved
+                    lastSuccessDeltaUm = targetUm;
+                end
                 bisectLevelsUsed = 0;
 
                 metrics = collect_metrics(model, bnd_rigid_top, bnd_rigid_bot, bnd_eval);
                 append_metrics_row(metricsPath, targetUm, deltaBaseUm, metrics);
-                try, mphsave(model, checkpointMph); catch, end
+                % Avoid regressing checkpoint_last_ok.mph when sampling below last_success.
+                if improved
+                    try, mphsave(model, checkpointMph); catch, end
+                else
+                    try
+                        sampleMph = fullfile(outDir, sprintf('Pyramid_5x5_checkpoint_sample_%0.9gum.mph', targetUm));
+                        mphsave(model, sampleMph);
+                    catch
+                    end
+                end
 
                 lastFzPlate = metrics.FzPlate;
                 if isfinite(lastFzPlate) && abs(lastFzPlate) > FzEps
                     contactOnsetDetected = true;
                     if ~isfinite(metrics.tnMax) || metrics.Ac <= 0
-                        contactNote = 'Force indicates onset but dcnt1 undefined/NaN';
+                        contactNote = 'Force indicates onset but dcnt1 metrics invalid (Ac<=0 or NaN)';
                     end
                 end
                 if strcmp(deltaPlanMode, 'post_onset_micro') && budgetUsedPost > budgetPostOnsetS && lastSuccessDeltaUm < earlyExitTargetUm
@@ -1267,7 +1455,94 @@ try
                 continue;
             end
 
+            if ptcOnlyMode
+                segmentedAttempted = false;
+                tdAttempted = false;
+                tdFailReason = tern(disableTdRelax, 'disabled by SIM_DISABLE_TD_RELAX', 'none');
+                segmentedFailReason = tern(disableSegmented, 'disabled by SIM_DISABLE_SEGMENTED', 'none');
+                failDeltaUm = targetUm;
+                failDeltaIndentUm = targetUm - deltaBaseUm;
+                failReason = ptcErrMsg;
+                narrowFailIntervalUm = [prevDeltaBefore, targetUm];
+                error('ptc_only_failed at %.6g um: %s', targetUm, ptcErrMsg);
+            end
+
             % Segmented fallback (stationary + per-stage PTC)
+            if disableSegmented
+                segmentedAttempted = false;
+                segmentedFailReason = 'disabled by SIM_DISABLE_SEGMENTED';
+
+                % TD_RELAX last fallback (when segmented is disabled)
+                if disableTdRelax
+                    tdAttempted = false;
+                    tdFailReason = 'disabled by SIM_DISABLE_TD_RELAX';
+                elseif ~is_consistent_init_error(segmentedFailReason) && ~is_consistent_init_error(ptcErrMsg)
+                    tdAttempted = true;
+                    bridgeAttemptId = bridgeAttemptId + 1;
+                    [budgetOk, budgetWhy] = ensure_budget(deltaPlanMode, budgetUsedPre, budgetUsedPost, budgetPreOnsetS, budgetPostOnsetS);
+                    if ~budgetOk
+                        if isfinite(lastSuccessDeltaUm)
+                            stopRequested = true;
+                            exitStatus = 'SUCCESS_BUT_BUDGET';
+                            stopReason = budgetWhy;
+                            break;
+                        end
+                        failReason = budgetWhy;
+                        error('%s', budgetWhy);
+                    end
+                    [reserveGateTriggered, reserveGateReason] = check_reserve_gate(deltaPlanMode, globalT0, globalTimeoutS, budgetPostOnsetS, reserveGateTriggered, reserveGateReason);
+                    if reserveGateTriggered
+                        failDeltaUm = targetUm;
+                        failDeltaIndentUm = targetUm - deltaBaseUm;
+                        failReason = reserveGateReason;
+                        narrowFailIntervalUm = [prevDeltaBefore, targetUm];
+                        error('%s', reserveGateReason);
+                    end
+                    startIso = now_iso();
+                    liveAttempt = make_live_attempt('STARTED', targetUm, 'TD_RELAX', startIso, startIso, 'none', NaN, 'none');
+                    flush_fallback_report(fallbackReportPath, liveAttempt, fallbackAttempts, preBisectAttempts, preBisectLastOk, preBisectFail, segmentedAttempts, microTargetAttempts, bridgePolicy, deltaPlanMode, microTargetsUm, budgetUsedPre, budgetUsedPost, budgetPreOnsetS, budgetPostOnsetS, reserveGateTriggered, toc(globalT0), globalTimeoutS - toc(globalT0));
+                    [tdOk, tdElapsed, tdErrMsg] = attempt_td_bridge('TD_RELAX', model, bnd_rigid_top, bnd_rigid_bot, bnd_eval, prevDeltaUm, targetUm, bridgeNT, bridgeDt, tdBridgePath, bridgeAttemptId);
+                    endIso = now_iso();
+                    liveAttempt = make_live_attempt(tern(tdOk,'ENDED','FAILED'), targetUm, 'TD_RELAX', startIso, endIso, endIso, tdElapsed, tern(tdOk,'none',tdErrMsg));
+                    [budgetUsedPre, budgetUsedPost] = consume_budget(deltaPlanMode, tdElapsed, budgetUsedPre, budgetUsedPost, budgetPreOnsetS, budgetPostOnsetS);
+                    microTargetAttempts(end+1) = make_micro_attempt(targetUm, 'TD_RELAX', tdOk, tdElapsed, tdErrMsg); %#ok<AGROW>
+                    flush_fallback_report(fallbackReportPath, liveAttempt, fallbackAttempts, preBisectAttempts, preBisectLastOk, preBisectFail, segmentedAttempts, microTargetAttempts, bridgePolicy, deltaPlanMode, microTargetsUm, budgetUsedPre, budgetUsedPost, budgetPreOnsetS, budgetPostOnsetS, reserveGateTriggered, toc(globalT0), globalTimeoutS - toc(globalT0));
+                    if tdOk
+                        fid = fopen(summaryPath, 'a', 'n', 'UTF-8');
+                        fprintf(fid, "    post_onset TD_RELAX OK at delta=%g um\n", targetUm);
+                        fclose(fid);
+                        hasSol = true;
+                        prevDeltaUm = targetUm;
+                        cntWasActive = (prevDeltaUm >= cntEnableUm);
+                        deltaHistoryUm(end+1) = targetUm; %#ok<AGROW>
+                        lastSuccessDeltaUm = targetUm;
+                        metrics = collect_metrics(model, bnd_rigid_top, bnd_rigid_bot, bnd_eval);
+                        append_metrics_row(metricsPath, targetUm, deltaBaseUm, metrics);
+                        try, mphsave(model, checkpointMph); catch, end
+                        if toc(globalT0) > globalTimeoutS
+                            stopRequested = true;
+                            exitStatus = 'SUCCESS_BUT_TIMEOUT';
+                            stopReason = sprintf('global_timeout_s exceeded after successful target delta=%g um: %.1fs > %.1fs', targetUm, toc(globalT0), globalTimeoutS);
+                            break;
+                        end
+                        if lastSuccessDeltaUm >= earlyExitTargetUm
+                            earlyExit = true;
+                            earlyExitReason = sprintf('Reached early-exit target >=%.6g', earlyExitTargetUm);
+                            break;
+                        end
+                        continue;
+                    end
+                    if is_consistent_init_error(tdErrMsg)
+                        error('td_relax_consistent_init at %.6g um: %s', targetUm, tdErrMsg);
+                    end
+                end
+
+                failDeltaUm = targetUm;
+                failDeltaIndentUm = targetUm - deltaBaseUm;
+                failReason = ptcErrMsg;
+                narrowFailIntervalUm = [prevDeltaBefore, targetUm];
+                error('post_onset_micro_failed at %.6g um: %s', targetUm, ptcErrMsg);
+            end
             segmentedAttempted = true;
             startIso = now_iso();
             liveAttempt = make_live_attempt('STARTED', targetUm, 'SEGMENTED', startIso, startIso, 'none', NaN, 'none');
@@ -1417,7 +1692,10 @@ try
             segmentedFailReason = segErrMsg;
 
             % TD_RELAX last fallback (avoid consistent-init loops)
-            if ~is_consistent_init_error(segmentedFailReason) && ~is_consistent_init_error(ptcErrMsg)
+            if disableTdRelax
+                tdAttempted = false;
+                tdFailReason = 'disabled by SIM_DISABLE_TD_RELAX';
+            elseif ~is_consistent_init_error(segmentedFailReason) && ~is_consistent_init_error(ptcErrMsg)
                 tdAttempted = true;
                 bridgeAttemptId = bridgeAttemptId + 1;
                 [budgetOk, budgetWhy] = ensure_budget(deltaPlanMode, budgetUsedPre, budgetUsedPost, budgetPreOnsetS, budgetPostOnsetS);
@@ -1574,20 +1852,15 @@ fprintf(fid, "reserve_gate_reason: %s\n", string_or_none(reserveGateReason));
 fprintf(fid, "early_exit: %d\n", earlyExit);
 fprintf(fid, "early_exit_reason: %s\n", string_or_none(earlyExitReason));
 tnEpsPa = numeric_env('SIM_TN_EPS_PA', 1.0);
-[okD, ~, ~, ~] = try_contact_metrics(model, bnd_eval, 'dcnt1', tnEpsPa);
+[okD, ~, ~, ~, whyD] = try_contact_metrics(model, bnd_eval, tnEpsPa);
+fprintf(fid, "contact_field_used: dcnt1\n");
 if okD
-    fprintf(fid, "contact_field_used: dcnt1\n");
-    fprintf(fid, "contact_field_reason: dcnt1_ok\n");
+    fprintf(fid, "contact_field_reason: dcnt1_ok (%s)\n", string_or_none(whyD));
 else
-    [okC, ~, ~, ~] = try_contact_metrics(model, bnd_eval, 'cnt1', tnEpsPa);
-    if okC
-        fprintf(fid, "contact_field_used: cnt1\n");
-        fprintf(fid, "contact_field_reason: cnt1 (dcnt1_undefined)\n");
-    else
-        fprintf(fid, "contact_field_used: none\n");
-        fprintf(fid, "contact_field_reason: dcnt1_and_cnt1_unavailable\n");
-    end
+    fprintf(fid, "contact_field_reason: dcnt1_unavailable (%s)\n", string_or_none(whyD));
 end
+fprintf(fid, "dcnt1_only_ok: %d\n", dcntOnlyOk);
+fprintf(fid, "dcnt1_only_note: %s\n", string_or_none(dcntOnlyNote));
 fclose(fid);
 
 % Ensure baseline_results.csv is written even on failure.
@@ -1755,9 +2028,15 @@ try, metrics.FzPlate = mphint2(model, 'solid.RFz', 'surface', 'selection', bnd_r
 end
 
 function [tnMax, Ac, pnAvg] = eval_contact_metrics(model, bnd_eval, tnEpsPa)
-% Contact postprocessing:
-% - Prefer dcnt1 if it is evaluable
-% - Fallback to cnt1 (5x5 models often have dcnt1 undefined while cnt1 is defined)
+% Contact postprocessing (dcnt1-only):
+% In this COMSOL setup, SolidContact (dcnt1) exposes unprefixed fields:
+%   solid.Tn, solid.incontact, solid.gap
+% (solid.dcnt1.* is often undefined even when the feature tag is dcnt1.)
+%
+% Priority for area:
+% 1) solid.incontact (preferred)
+% 2) solid.Tn threshold
+% 3) solid.gap < 0
 tnMax = NaN;
 Ac = 0;
 pnAvg = NaN;
@@ -1765,34 +2044,37 @@ if nargin < 3 || ~isfinite(tnEpsPa)
     tnEpsPa = 1.0;
 end
 
-[okD, tnD, acD, pnD] = try_contact_metrics(model, bnd_eval, 'dcnt1', tnEpsPa);
+[okD, tnD, acD, pnD] = try_contact_metrics(model, bnd_eval, tnEpsPa);
 if okD
     tnMax = tnD; Ac = acD; pnAvg = pnD;
-    return;
-end
-[okC, tnC, acC, pnC] = try_contact_metrics(model, bnd_eval, 'cnt1', tnEpsPa);
-if okC
-    tnMax = tnC; Ac = acC; pnAvg = pnC;
-    return;
 end
 end
 
-function [ok, tnMax, Ac, pnAvg] = try_contact_metrics(model, bnd_eval, tagPrefix, tnEpsPa)
+function [ok, tnMax, Ac, pnAvg, why] = try_contact_metrics(model, bnd_eval, tnEpsPa)
 ok = false;
 tnMax = NaN;
 Ac = 0;
 pnAvg = NaN;
+why = 'none';
 try
-    tnVar = sprintf('solid.%s.Tn', tagPrefix);
-    incontactVar = sprintf('solid.%s.incontact', tagPrefix);
+    tnVar = 'solid.Tn';
+    incontactVar = 'solid.incontact';
+    gapVar = 'solid.gap';
 
     tnMax = mphmax(model, tnVar, 'surface', 'selection', bnd_eval);
 
-    % Prefer incontact if available, else use Tn threshold.
+    % Prefer incontact if available, else use Tn threshold, else gap<0.
     try
         Ac = mphint2(model, sprintf('if(%s>0.5,1,0)', incontactVar), 'surface', 'selection', bnd_eval);
+        why = 'incontact';
     catch
-        Ac = mphint2(model, sprintf('if(%s>%g,1,0)', tnVar, tnEpsPa), 'surface', 'selection', bnd_eval);
+        try
+            Ac = mphint2(model, sprintf('if(%s>%g,1,0)', tnVar, tnEpsPa), 'surface', 'selection', bnd_eval);
+            why = sprintf('Tn>%gPa', tnEpsPa);
+        catch
+            Ac = mphint2(model, sprintf('if(%s<0,1,0)', gapVar), 'surface', 'selection', bnd_eval);
+            why = 'gap<0';
+        end
     end
 
     pnInt = mphint2(model, tnVar, 'surface', 'selection', bnd_eval);
@@ -1808,6 +2090,7 @@ catch
     tnMax = NaN;
     Ac = 0;
     pnAvg = NaN;
+    why = 'exception';
 end
 end
 
@@ -2039,17 +2322,134 @@ lines = lines(lines ~= "");
 if numel(lines) < 2
     return;
 end
-lastLine = lines(end);
-parts = strsplit(char(lastLine), ',');
-if numel(parts) >= 2
-    lastSuccessUm = str2double(parts{2});
+% Use the maximum delta_total_um as "last_success" (more robust than the last row,
+% and allows appending non-monotone sampling points for RP).
+bestDelta = -Inf;
+bestFz = NaN;
+for i = 2:numel(lines)
+    parts = strsplit(char(lines(i)), ',');
+    if numel(parts) < 2
+        continue;
+    end
+    d = str2double(parts{2});
+    if ~isfinite(d)
+        continue;
+    end
+    if d > bestDelta
+        bestDelta = d;
+        if numel(parts) >= 8
+            bestFz = str2double(parts{8});
+        else
+            bestFz = NaN;
+        end
+    end
 end
-if numel(parts) >= 8
-    lastFzPlateN = str2double(parts{8});
+if isfinite(bestDelta)
+    lastSuccessUm = bestDelta;
+    lastFzPlateN = bestFz;
 end
 end
 
-function [supported, effective, note] = apply_contact_mode(cnt, contactMode, penaltyFactorMult, contactTolScale)
+function [ok, note] = enforce_dcnt1_only(solid, dcntTag, cntTag, pairTag)
+% Enforce a single SolidContact feature (dcnt1) as the only contact implementation.
+% Best-effort across COMSOL versions: try remove obsolete Contact (cnt1), else deactivate it.
+% Also bind dcnt1 explicitly to the contact pair tag (e.g. 'pc').
+ok = false;
+note = 'none';
+
+% Disable/remove obsolete cnt1.
+try
+    solid.feature(cntTag);
+    hasCnt = true;
+catch
+    hasCnt = false;
+end
+if hasCnt
+    removed = false;
+    try
+        solid.feature.remove(cntTag);
+        removed = true;
+        note = 'cnt1_removed';
+    catch
+    end
+    if ~removed
+        try
+            solid.feature(cntTag).active(false);
+            note = 'cnt1_deactivated';
+        catch ME
+            note = "cnt1_disable_failed: " + string(ME.message);
+        end
+    end
+end
+
+% Ensure dcnt exists and is active.
+try
+    dcnt = solid.feature(dcntTag);
+catch ME
+    note = "missing_" + string(dcntTag) + ": " + string(ME.message);
+    return;
+end
+try, dcnt.active(true); catch, end
+
+% Bind explicitly to pair.
+pairOk = bind_pair_to_feature(dcnt, pairTag);
+ok = pairOk;
+if ~pairOk
+    note = "dcnt_pair_bind_failed(" + string(pairTag) + ")";
+end
+end
+
+function ok = bind_pair_to_feature(feat, pairTag)
+% Try several key spellings used across COMSOL feature types/versions.
+ok = false;
+try, feat.set('pairSelection', 'list'); catch, end
+try, feat.set('pairselection', 'list'); catch, end
+try
+    feat.set('pairs', {pairTag});
+catch
+end
+try
+    arr = javaArray('java.lang.String', 1);
+    arr(1) = java.lang.String(pairTag);
+    feat.set('pairs', arr);
+catch
+end
+try
+    feat.set('pair', pairTag);
+catch
+end
+try
+    feat.set('pairname', pairTag);
+catch
+end
+
+% Verify binding actually took effect.
+ok = is_pair_bound(feat, pairTag);
+end
+
+function ok = is_pair_bound(feat, pairTag)
+ok = false;
+try
+    arr = feat.getStringArray('pairs');
+    c = cell(arr);
+    c = cellfun(@char, c, 'UniformOutput', false);
+    if any(strcmp(c, pairTag))
+        ok = true;
+        return;
+    end
+catch
+end
+try
+    v = char(feat.getString('pairs'));
+    if strcmp(strtrim(v), pairTag)
+        ok = true;
+        return;
+    end
+catch
+end
+end
+
+function [supported, effective, note] = apply_contact_mode(cnt, featureTag, contactMode, penaltyFactorMult, contactTolScale)
 supported = true;
 effective = contactMode;
 note = 'none';
@@ -2059,7 +2459,7 @@ try
         case 'penalty_soft'
             cnt.set('ContactMethodCtrl', 'Penalty');
             cnt.set('penaltyCtrl', 'userDefined');
-            baseExpr = '0.01*solid.cnt1.E_char/solid.hmin_dst';
+            baseExpr = sprintf('0.01*solid.%s.E_char/solid.hmin_dst', featureTag);
             expr = sprintf('%g*(%s)', penaltyFactorMult, baseExpr);
             cnt.set('pn_penalty', expr);
         case 'penalty_auto'
@@ -2093,9 +2493,18 @@ function ok = try_set_contact_method(cnt, candidates)
 ok = false;
 for i = 1:numel(candidates)
     try
-        cnt.set('ContactMethodCtrl', candidates{i});
-        ok = true;
-        return;
+        try
+            cnt.set('ContactMethodCtrl', candidates{i});
+            ok = true;
+            return;
+        catch
+        end
+        try
+            cnt.set('method', candidates{i});
+            ok = true;
+            return;
+        catch
+        end
     catch
     end
 end
@@ -2360,10 +2769,10 @@ end
 function [cntActive, useInit] = prepare_stationary_step(model, solid, st, candUm, cntEnableUm, cntWasActive, hasSol)
 useInit = tern(hasSol,'on','off');
 try, st.set('useinitsol', useInit); catch, end
-try, solid.feature('cnt1').active(false); catch, end
+try, solid.feature('dcnt1').active(false); catch, end
 try, model.param.set('delta', sprintf('%g[um]', candUm)); catch, end
 cntActive = (candUm >= cntEnableUm);
-try, solid.feature('cnt1').active(cntActive); catch, end
+try, solid.feature('dcnt1').active(cntActive); catch, end
 if cntActive && ~cntWasActive
     useInit = 'off';
 end
@@ -2414,6 +2823,21 @@ payload.delta_plan_mode = deltaPlanMode;
 payload.micro_targets = microTargetsUm;
 payload.post_skip_stationary = get_env_bool('SIM_POST_SKIP_STATIONARY', false);
 payload.ptc_first = payload.post_skip_stationary;
+payload.disable_segmented = get_env_bool('SIM_DISABLE_SEGMENTED', false);
+payload.disable_td_relax = get_env_bool('SIM_DISABLE_TD_RELAX', false);
+try
+    resumeFlag = ~isempty(strtrim(getenv('RESUME_POST_ONSET_ONLY'))) && any(strcmpi(strtrim(getenv('RESUME_POST_ONSET_ONLY')), {'1','true','on'}));
+catch
+    resumeFlag = false;
+end
+payload.ptc_only_mode = payload.disable_segmented && payload.disable_td_relax && resumeFlag && ~isempty(strtrim(getenv('SIM_SINGLE_TARGET_UM')));
+payload.segmented_attempted = ~isempty(segmentedAttempts);
+try
+    tdOrders = {microTargetAttempts.attempt_order};
+catch
+    tdOrders = {};
+end
+payload.td_attempted = any(strcmpi(tdOrders, 'TD_RELAX')) || any(strcmpi({attempts.method}, 'td_relax'));
 payload.budget_used_pre_s = budgetUsedPre;
 payload.budget_used_post_s = budgetUsedPost;
 payload.budget_pre_onset_s = budgetPreOnsetS;
@@ -2483,7 +2907,7 @@ try
     end
 
     if ok
-        write_td_bridge_results(tdBridgePath, attemptId, mode, deltaStartUm, deltaEndUm, bridgeNT, bnd_eval, bnd_rigid_top, model);
+        write_td_bridge_results(tdBridgePath, attemptId, mode, deltaStartUm, deltaEndUm, bridgeDt, bnd_eval, bnd_rigid_top, model);
     else
         append_td_bridge_failure(tdBridgePath, attemptId, mode, deltaEndUm);
     end
@@ -2509,7 +2933,7 @@ errMsg = '';
 ensure_ptc_bridge_header(ptcBridgePath);
 try
     model.param.set('delta', sprintf('%g[um]', deltaEndUm));
-    try, solid.feature('cnt1').active(true); catch, end
+    try, solid.feature('dcnt1').active(true); catch, end
     try, st.set('useinitsol', 'on'); catch, end
     try, st.set('initmethod', 'sol'); catch, end
     try, st.set('initsol', 'current'); catch, end
@@ -2572,7 +2996,7 @@ resNorm = NaN;
 Ac = NaN;
 Fz = NaN;
 try
-    Ac = mphint2(model, 'if(solid.dcnt1.Tn>0,1,0)', 'surface', 'selection', bnd_eval);
+    Ac = mphint2(model, 'if(solid.incontact>0.5,1,0)', 'surface', 'selection', bnd_eval);
 catch
     Ac = NaN;
 end
@@ -2591,8 +3015,14 @@ fprintf(fid, 'attempt_id,bridge_mode,t,delta_target_um,Ac_m2,pn_avg_Pa,Fz_plate_
 fclose(fid);
 end
 
-function write_td_bridge_results(path, attemptId, mode, deltaStartUm, deltaEndUm, bridgeNT, bnd_eval, bnd_rigid_top, model)
-tlist = linspace(0, 1, bridgeNT);
+function write_td_bridge_results(path, attemptId, mode, deltaStartUm, deltaEndUm, bridgeDt, bnd_eval, bnd_rigid_top, model)
+if ~isfinite(bridgeDt) || bridgeDt <= 0
+    bridgeDt = 0.05;
+end
+tlist = 0:bridgeDt:1;
+if isempty(tlist) || abs(tlist(end) - 1) > 1e-12
+    tlist = [tlist, 1];
+end
 fid = fopen(path, 'a', 'n', 'UTF-8');
 for i = 1:numel(tlist)
     t = tlist(i);
@@ -2602,8 +3032,8 @@ for i = 1:numel(tlist)
     pnAvg = NaN;
     Fz = NaN;
     try
-        Ac = mphint2(model, 'if(solid.dcnt1.Tn>0,1,0)', 'surface', 'selection', bnd_eval, 't', t);
-        pnInt = mphint2(model, 'solid.dcnt1.Tn', 'surface', 'selection', bnd_eval, 't', t);
+        Ac = mphint2(model, 'if(solid.incontact>0.5,1,0)', 'surface', 'selection', bnd_eval, 't', t);
+        pnInt = mphint2(model, 'solid.Tn', 'surface', 'selection', bnd_eval, 't', t);
         if isfinite(Ac) && Ac > 0
             pnAvg = pnInt ./ Ac;
         end
@@ -2624,4 +3054,180 @@ function append_td_bridge_failure(path, attemptId, mode, deltaEndUm)
 fid = fopen(path, 'a', 'n', 'UTF-8');
 fprintf(fid, '%d,%s,NaN,%.6g,NaN,NaN,NaN\n', attemptId, mode, deltaEndUm);
 fclose(fid);
+end
+
+function [bndFiltered, zTopUm, zThresholdUm] = filter_boundaries_by_centroid_z(model, bndIds, zWindowUm)
+%FILTER_BOUNDARIES_BY_CENTROID_Z Keep only boundaries with centroid_z within z_window of the topmost centroid.
+% Uses coordinate-only integrals, so it does not depend on solution fields.
+
+if isempty(bndIds)
+    bndFiltered = [];
+    zTopUm = NaN;
+    zThresholdUm = NaN;
+    return;
+end
+
+centZ = nan(size(bndIds));
+area = nan(size(bndIds));
+for i = 1:numel(bndIds)
+    bid = bndIds(i);
+    try
+        a = mphint2(model, '1', 'surface', 'selection', bid);
+        area(i) = a;
+    catch
+        area(i) = NaN;
+    end
+    try
+        zint = mphint2(model, 'z', 'surface', 'selection', bid);
+    catch
+        zint = mphint2(model, 'comp1.z', 'surface', 'selection', bid);
+    end
+    if isfinite(area(i)) && area(i) > 0
+        centZ(i) = zint / area(i);
+    else
+        centZ(i) = NaN;
+    end
+end
+
+zTop = max(centZ(isfinite(centZ)));
+if isempty(zTop) || ~isfinite(zTop)
+    bndFiltered = [];
+    zTopUm = NaN;
+    zThresholdUm = NaN;
+    return;
+end
+
+zThreshold = zTop - (zWindowUm * 1e-6);
+keep = isfinite(centZ) & centZ >= zThreshold;
+bndFiltered = bndIds(keep);
+zTopUm = zTop * 1e6;
+zThresholdUm = zThreshold * 1e6;
+end
+
+function [hmaxM, hminM] = extract_mesh_hmax_hmin(ms)
+hmaxM = NaN;
+hminM = NaN;
+try
+    if isfield(ms, 'hmax') && isfinite(ms.hmax)
+        hmaxM = ms.hmax;
+    end
+    if isfield(ms, 'hmin') && isfinite(ms.hmin)
+        hminM = ms.hmin;
+    end
+catch
+end
+end
+
+function [minQ, nInv] = extract_mesh_quality(ms)
+minQ = NaN;
+nInv = NaN;
+try
+    if isfield(ms, 'minquality')
+        minQ = ms.minquality;
+    elseif isfield(ms, 'minqual')
+        minQ = ms.minqual;
+    elseif isfield(ms, 'qualitymin')
+        minQ = ms.qualitymin;
+    end
+catch
+end
+try
+    if isfield(ms, 'ninverted')
+        nInv = ms.ninverted;
+    elseif isfield(ms, 'inverted')
+        nInv = ms.inverted;
+    elseif isfield(ms, 'numinverted')
+        nInv = ms.numinverted;
+    end
+catch
+end
+end
+
+function rebuild_mesh_with_local_size(mesh1, bndFiltered, hgrad, hmaxM, hminM)
+%REBUILD_MESH_WITH_LOCAL_SIZE Rebuild a stable mesh sequence with a global Size(hauto=3)
+% plus a local Size on selected boundaries. This avoids empty-mesh issues seen when adding
+% a size feature into a purely automatic mesh sequence.
+
+% Clear existing mesh features (best-effort; template may be automatic-generated).
+try
+    tags = cell(mesh1.feature.tags);
+    for i = 1:numel(tags)
+        try, mesh1.feature.remove(tags{i}); catch, end
+    end
+catch
+end
+
+% Global size (keep baseline comparable to autoMeshSize(3)).
+try
+    mesh1.feature.create('size1', 'Size');
+    try, mesh1.feature('size1').selection.all; catch, end
+    try, mesh1.feature('size1').set('hauto', 3); catch, end
+catch
+end
+
+% Local size on filtered contact-adjacent boundaries.
+try
+    mesh1.feature.create('size_local_contact', 'Size');
+catch
+end
+try
+    sz = mesh1.feature('size_local_contact');
+    try, sz.selection.geom('geom1', 2); catch, end
+    try, sz.selection.set(bndFiltered(:)'); catch, end
+    try, sz.set('hgradactive', 1); catch, end
+    try, sz.set('hgrad', hgrad); catch, end
+    try, sz.set('hmaxactive', 1); catch, end
+    try, sz.set('hmax', sprintf('%.6g[m]', hmaxM)); catch, end
+    try, sz.set('hminactive', 1); catch, end
+    try, sz.set('hmin', sprintf('%.6g[m]', hminM)); catch, end
+catch
+end
+
+% Free tetrahedral mesh (with boundary triangulation).
+try
+    mesh1.feature.create('ftri1', 'FreeTri');
+    try, mesh1.feature('ftri1').selection.geom('geom1', 2); catch, end
+    try, mesh1.feature('ftri1').selection.all; catch, end
+catch
+end
+try
+    mesh1.feature.create('ftet1', 'FreeTet');
+    try, mesh1.feature('ftet1').selection.geom('geom1', 3); catch, end
+    try, mesh1.feature('ftet1').selection.all; catch, end
+    % Improve quality / smoothing (best-effort; not all COMSOL versions expose these keys).
+    try, mesh1.feature('ftet1').set('improve', 1); catch, end
+    try, mesh1.feature('ftet1').set('optimize', 1); catch, end
+    try, mesh1.feature('ftet1').set('smoothing', 1); catch, end
+catch
+end
+end
+
+function [nLt0p1, nLt0p01] = extract_mesh_quality_counts(ms)
+nLt0p1 = NaN;
+nLt0p01 = NaN;
+
+% COMSOL mesh stats structures vary by version; attempt best-effort extraction.
+try
+    if isfield(ms, 'quality') && ~isempty(ms.quality)
+        q = ms.quality;
+        q = q(:);
+        q = q(isfinite(q));
+        nLt0p1 = sum(q < 0.1);
+        nLt0p01 = sum(q < 0.01);
+        return;
+    end
+catch
+end
+
+try
+    if isfield(ms, 'qualities') && ~isempty(ms.qualities)
+        q = ms.qualities;
+        q = q(:);
+        q = q(isfinite(q));
+        nLt0p1 = sum(q < 0.1);
+        nLt0p01 = sum(q < 0.01);
+        return;
+    end
+catch
+end
 end

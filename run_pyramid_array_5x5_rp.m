@@ -14,7 +14,8 @@ function run_pyramid_array_5x5_rp()
 % IMPORTANT:
 % - Mechanical solve uses displacement-control (delta) for robustness, then computes an effective pressure
 %   P_eff = |Fz_top| / A_top, where A_top = W*W.
-% - Contact quantities use solid.dcnt1.Tn (single source of truth; explicitly bound to pair pc).
+% - Contact quantities use SolidContact (dcnt1). In this COMSOL setup the exposed fields are:
+%   solid.Tn, solid.incontact, solid.gap (unprefixed).
 
 outPyramidDir = fullfile(pwd, 'out', 'pyramid_5x5');
 rpFromSimDir = getenv('RP_FROM_SIM_DIR');
@@ -82,6 +83,33 @@ deltaList = Tsim.delta_total_um(:);
 FzTop = Tsim.Fz_plate_top_int_N(:);
 tnMax = Tsim.Tn_max_Pa(:);
 Ac = Tsim.Ac_m2(:);
+
+% If Ac is all-zero, optionally patch the last-success row using the saved checkpoint and
+% dcnt1-only contact fields (long-term single source of truth).
+tnEpsPa = numeric_env('SIM_TN_EPS_PA', 1.0);
+hasAnyAc = any(isfinite(Ac) & Ac > 0);
+if ~hasAnyAc && ~strcmpi(string(simCheckpointPath), "NA") && exist(simCheckpointPath, 'file')
+    [okPatch, acPatch, tnPatch, contactFieldUsed, contactFieldReason] = contact_from_checkpoint(simCheckpointPath, tnEpsPa);
+    if okPatch && isfinite(acPatch) && acPatch > 0
+        idxPatch = find(deltaList == max(deltaList), 1, 'last');
+        if isempty(idxPatch), idxPatch = numel(deltaList); end
+        Ac(idxPatch) = acPatch;
+        tnMax(idxPatch) = tnPatch;
+        try, Tsim.Ac_m2(idxPatch) = acPatch; catch, end
+        try, Tsim.Tn_max_Pa(idxPatch) = tnPatch; catch, end
+
+        fid = fopen(summaryPath, 'a', 'n', 'UTF-8');
+        fprintf(fid, "  - Ac patch applied from checkpoint\n");
+        fprintf(fid, "    contact_field_used: %s\n", contactFieldUsed);
+        fprintf(fid, "    contact_field_reason: %s\n", contactFieldReason);
+        fprintf(fid, "    Tn_eps_Pa: %.6g\n", tnEpsPa);
+        fprintf(fid, "    patched_row_idx: %d\n", idxPatch);
+        fprintf(fid, "    patched_delta_total_um: %.6g\n", deltaList(idxPatch));
+        fprintf(fid, "    patched_Ac_m2: %.6g\n", acPatch);
+        fclose(fid);
+    end
+end
+
 P_eff = abs(FzTop) ./ max(A_top, eps);
 
 R1 = rhoA / tA; % Ω (since L=W=100 um)
@@ -143,8 +171,8 @@ for i = 1:numel(deltaList)
     try, FzTop(i) = mphint2(model, 'solid.RFz', 'surface', 'selection', bnd_force); catch, end
     P_eff(i) = abs(FzTop(i)) / max(A_top, eps);
 
-    try, tnMax(i) = mphmax(model, 'solid.dcnt1.Tn', 'surface', 'selection', bnd_dst); catch, end
-    try, Ac(i) = mphint2(model, 'if(solid.dcnt1.Tn>0,1,0)', 'surface', 'selection', bnd_dst); catch, end
+    try, tnMax(i) = mphmax(model, 'solid.Tn', 'surface', 'selection', bnd_dst); catch, end
+    try, Ac(i) = mphint2(model, 'if(solid.incontact>0.5,1,0)', 'surface', 'selection', bnd_dst); catch, end
 
     if isfinite(Ac(i)) && Ac(i) > 0
         Rc(i) = rho_c / Ac(i);
@@ -262,14 +290,98 @@ if p == ""
     p = "";
     return;
 end
-pp = char(p);
-if isfolder(pp) || isfile(pp)
-    p = pp;
+
+isAbs = ~isempty(regexp(p, '^[A-Za-z]:[\\/]', 'once')) || startsWith(p, "\\\\") || startsWith(p, "/") || startsWith(p, "\\");
+if ~isAbs
+    p = string(fullfile(baseDir, char(p)));
+end
+p = char(p);
+end
+
+function out = numeric_env(name, defaultVal)
+val = getenv(name);
+if isempty(val)
+    out = defaultVal;
     return;
 end
+v = str2double(strtrim(val));
+if isfinite(v)
+    out = v;
+else
+    out = defaultVal;
+end
+end
+
+function [ok, Ac, tnMax, used, reason] = contact_from_checkpoint(checkpointPath, tnEpsPa)
+ok = false;
+Ac = NaN;
+tnMax = NaN;
+used = "none";
+reason = "none";
 try
-    p = fullfile(baseDir, pp);
-catch
-    p = pp;
+    import com.comsol.model.util.*
+    [~, ~, proc] = comsol_matlab_connect(); %#ok<ASGLU>
+    model = mphload(checkpointPath);
+    model.hist.disable();
+    comp = model.component('comp1');
+    pc = comp.pair('pc');
+    bndDst = pc.destination.entities;
+
+    [okD, tnD, acD, whyD] = try_contact_metrics(model, bndDst, tnEpsPa);
+    if okD
+        ok = true; Ac = acD; tnMax = tnD; used = "dcnt1"; reason = "dcnt1_ok (" + whyD + ")";
+    else
+        ok = false; used = "dcnt1"; reason = "dcnt1_fail: " + whyD;
+    end
+
+    ModelUtil.disconnect();
+    try
+        if ~isempty(proc) && ~proc.HasExited
+            proc.WaitForExit(2000);
+        end
+        if ~isempty(proc) && ~proc.HasExited
+            proc.Kill();
+            proc.WaitForExit();
+        end
+    catch
+    end
+catch ME
+    ok = false;
+    used = "none";
+    reason = "exception: " + string(ME.message);
+end
+end
+
+function [ok, tnMax, Ac, why] = try_contact_metrics(model, bndDst, tnEpsPa)
+ok = false;
+tnMax = NaN;
+Ac = NaN;
+why = "none";
+try
+    tnVar = 'solid.Tn';
+    incontactVar = 'solid.incontact';
+    tnMax = mphmax(model, tnVar, 'surface', 'selection', bndDst);
+
+    % dcnt1-only priority:
+    % 1) incontact, 2) Tn threshold, 3) gap<0
+    try
+        Ac = mphint2(model, sprintf('if(%s>0.5,1,0)', incontactVar), 'surface', 'selection', bndDst);
+        why = "incontact";
+    catch
+        try
+            Ac = mphint2(model, sprintf('if(%s>%g,1,0)', tnVar, tnEpsPa), 'surface', 'selection', bndDst);
+            why = "Tn_eps";
+        catch
+            gapVar = 'solid.gap';
+            Ac = mphint2(model, sprintf('if(%s<0,1,0)', gapVar), 'surface', 'selection', bndDst);
+            why = "gap<0";
+        end
+    end
+    ok = true;
+catch ME
+    ok = false;
+    why = string(ME.message);
+    tnMax = NaN;
+    Ac = NaN;
 end
 end
