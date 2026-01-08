@@ -69,10 +69,15 @@ modelSource = tpl;
 if resumePostOnsetOnly
     modelSource = resumeCheckpointPath;
 end
+
+% Optional: switch linear solver mode (e.g. force Direct(PARDISO)) for this run.
+linearSolverMode = get_env_or_default('SIM_LINEAR_SOLVER_MODE', 'default');
+linearSolverSwitched = false;
+linearSolverNote = 'none';
+
 model = mphload(modelSource);
 model.hist.disable();
 
-% Optional: switch linear solver mode (e.g. force Direct(PARDISO)) for this run.
 try
     [linearSolverSwitched, linearSolverNote] = configure_linear_solver_mode(model, linearSolverMode);
 catch ME
@@ -196,9 +201,6 @@ meshMinQuality = NaN;
 meshInvertedElements = NaN;
 meshCountQualLt0p1 = NaN;
 meshCountQualLt0p01 = NaN;
-linearSolverMode = get_env_or_default('SIM_LINEAR_SOLVER_MODE', 'default');
-linearSolverSwitched = false;
-linearSolverNote = 'none';
 contactMode = get_env_or_default('PHASE2_CONTACT_MODE', 'penalty_soft');
 contactModeRequested = contactMode;
 nuMode = get_env_or_default('PHASE2_NU_MODE', 'prod');
