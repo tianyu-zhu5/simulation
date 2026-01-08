@@ -18,13 +18,22 @@ function run_pyramid_array_5x5_rp()
 %   solid.Tn, solid.incontact, solid.gap (unprefixed).
 
 outPyramidDir = fullfile(pwd, 'out', 'pyramid_5x5');
+rpFromPressureSweepDir = getenv('RP_FROM_PRESSURE_SWEEP_DIR');
+usePressureSweep = ~isempty(strtrim(rpFromPressureSweepDir));
 rpFromSimDir = getenv('RP_FROM_SIM_DIR');
-if isempty(strtrim(rpFromSimDir))
+if ~usePressureSweep && isempty(strtrim(rpFromSimDir))
     rpFromSimDir = find_latest_sim_dir(outPyramidDir);
 end
-rpFromSimDir = resolve_path(pwd, rpFromSimDir);
-if isempty(strtrim(rpFromSimDir)) || ~exist(rpFromSimDir, 'dir')
-    error('RP_FROM_SIM_DIR not set and no out/pyramid_5x5/sim_* found.');
+if usePressureSweep
+    rpFromPressureSweepDir = resolve_path(pwd, rpFromPressureSweepDir);
+    if isempty(strtrim(rpFromPressureSweepDir)) || ~exist(rpFromPressureSweepDir, 'dir')
+        error('RP_FROM_PRESSURE_SWEEP_DIR set but directory not found: %s', rpFromPressureSweepDir);
+    end
+else
+    rpFromSimDir = resolve_path(pwd, rpFromSimDir);
+    if isempty(strtrim(rpFromSimDir)) || ~exist(rpFromSimDir, 'dir')
+        error('RP_FROM_SIM_DIR not set and no out/pyramid_5x5/sim_* found.');
+    end
 end
 
 simDir = fullfile(outPyramidDir, ['rp_' datestr(now, 'yyyymmdd_HHMMSS')]);
@@ -35,13 +44,22 @@ end
 summaryPath = fullfile(simDir, 'RP_summary.txt');
 rawCsvPath = fullfile(simDir, 'RP_raw.csv');
 interpCsvPath = fullfile(simDir, 'RP_interp.csv');
-simMetricsPath = fullfile(rpFromSimDir, 'Pyramid_5x5_metrics.csv');
-simCheckpointPath = fullfile(rpFromSimDir, 'Pyramid_5x5_checkpoint_last_ok.mph');
-if ~exist(simCheckpointPath, 'file')
+rpPressureCsvPath = fullfile(simDir, 'rp_pressure.csv');
+if usePressureSweep
+    simMetricsPath = fullfile(rpFromPressureSweepDir, 'metrics_pressure.csv');
     simCheckpointPath = 'NA';
-end
-if ~exist(simMetricsPath, 'file')
-    error('Missing mechanical metrics: %s', simMetricsPath);
+    if ~exist(simMetricsPath, 'file')
+        error('Missing pressure sweep metrics: %s', simMetricsPath);
+    end
+else
+    simMetricsPath = fullfile(rpFromSimDir, 'Pyramid_5x5_metrics.csv');
+    simCheckpointPath = fullfile(rpFromSimDir, 'Pyramid_5x5_checkpoint_last_ok.mph');
+    if ~exist(simCheckpointPath, 'file')
+        simCheckpointPath = 'NA';
+    end
+    if ~exist(simMetricsPath, 'file')
+        error('Missing mechanical metrics: %s', simMetricsPath);
+    end
 end
 
 % Geometry size (SI)
@@ -57,7 +75,13 @@ Pmin = 0.28e3;
 Pmax = 1.00e3;
 
 fid = fopen(summaryPath, 'w', 'n', 'UTF-8');
-fprintf(fid, "rp_from_sim_dir: %s\n", rpFromSimDir);
+if usePressureSweep
+    fprintf(fid, "rp_from_pressure_sweep_dir: %s\n", rpFromPressureSweepDir);
+    fprintf(fid, "rp_from_sim_dir: NA\n");
+else
+    fprintf(fid, "rp_from_pressure_sweep_dir: NA\n");
+    fprintf(fid, "rp_from_sim_dir: %s\n", rpFromSimDir);
+end
 fprintf(fid, "sim_metrics_path: %s\n", simMetricsPath);
 fprintf(fid, "sim_checkpoint_path: %s\n", simCheckpointPath);
 fprintf(fid, "W_m: %.6g\n", W_si);
@@ -72,17 +96,33 @@ fclose(fid);
 
 % Load mechanical metrics from the specified sim output directory.
 Tsim = readtable(simMetricsPath, 'PreserveVariableNames', true);
-needCols = {'delta_total_um','Fz_plate_top_int_N','Tn_max_Pa','Ac_m2'};
-for iC = 1:numel(needCols)
-    if ~any(strcmp(Tsim.Properties.VariableNames, needCols{iC}))
-        error('sim_metrics missing column: %s', needCols{iC});
+if usePressureSweep
+    needCols = {'P_load_kPa','P_eff_Pa','Fz_top_int_N','Tn_max_Pa','Ac_m2'};
+    for iC = 1:numel(needCols)
+        if ~any(strcmp(Tsim.Properties.VariableNames, needCols{iC}))
+            error('pressure metrics missing column: %s', needCols{iC});
+        end
     end
+    if any(strcmp(Tsim.Properties.VariableNames, 'success'))
+        Tsim = Tsim(Tsim.success == 1, :);
+    end
+    PloadKPa = Tsim.P_load_kPa(:);
+    P_eff = Tsim.P_eff_Pa(:);
+    FzTop = Tsim.Fz_top_int_N(:);
+    tnMax = Tsim.Tn_max_Pa(:);
+    Ac = Tsim.Ac_m2(:);
+else
+    needCols = {'delta_total_um','Fz_plate_top_int_N','Tn_max_Pa','Ac_m2'};
+    for iC = 1:numel(needCols)
+        if ~any(strcmp(Tsim.Properties.VariableNames, needCols{iC}))
+            error('sim_metrics missing column: %s', needCols{iC});
+        end
+    end
+    deltaList = Tsim.delta_total_um(:);
+    FzTop = Tsim.Fz_plate_top_int_N(:);
+    tnMax = Tsim.Tn_max_Pa(:);
+    Ac = Tsim.Ac_m2(:);
 end
-
-deltaList = Tsim.delta_total_um(:);
-FzTop = Tsim.Fz_plate_top_int_N(:);
-tnMax = Tsim.Tn_max_Pa(:);
-Ac = Tsim.Ac_m2(:);
 
 % If Ac is all-zero, optionally patch the last-success row using the saved checkpoint and
 % dcnt1-only contact fields (long-term single source of truth).
@@ -110,7 +150,9 @@ if ~hasAnyAc && ~strcmpi(string(simCheckpointPath), "NA") && exist(simCheckpoint
     end
 end
 
-P_eff = abs(FzTop) ./ max(A_top, eps);
+if ~usePressureSweep
+    P_eff = abs(FzTop) ./ max(A_top, eps);
+end
 
 R1 = rhoA / tA; % Ω (since L=W=100 um)
 R2 = R1;
@@ -127,7 +169,11 @@ for i = 1:numel(deltaList)
 end
 
 fid = fopen(summaryPath, 'a', 'n', 'UTF-8');
-fprintf(fid, "  - loaded mechanical metrics rows: %d\n", numel(deltaList));
+if usePressureSweep
+    fprintf(fid, "  - loaded pressure metrics rows: %d\n", numel(P_eff));
+else
+    fprintf(fid, "  - loaded mechanical metrics rows: %d\n", numel(deltaList));
+end
 fclose(fid);
 
 lastErrorMsg = '';
@@ -186,11 +232,17 @@ end
 mphsave(model, outMph);
 end
 
-% Write raw CSV (delta-sweep)
+% Write raw CSV
 try
-    Traw = table(deltaList(:), P_eff(:), FzTop(:), tnMax(:), Ac(:), repmat(R1, numel(deltaList), 1), repmat(R2, numel(deltaList), 1), Rc(:), R(:), ...
-        'VariableNames', {'delta_total_um','P_eff_Pa','Fz_top_int_N','Tn_max_Pa','Ac_m2','R1_ohm','R2_ohm','Rc_ohm','R_total_ohm'});
-    writetable(Traw, rawCsvPath);
+    if usePressureSweep
+        TrawP = table(PloadKPa(:), P_eff(:), FzTop(:), tnMax(:), Ac(:), repmat(R1, numel(P_eff), 1), repmat(R2, numel(P_eff), 1), Rc(:), R(:), ...
+            'VariableNames', {'P_load_kPa','P_eff_Pa','Fz_top_int_N','Tn_max_Pa','Ac_m2','R1_ohm','R2_ohm','Rc_ohm','R_total_ohm'});
+        writetable(TrawP, rpPressureCsvPath);
+    else
+        Traw = table(deltaList(:), P_eff(:), FzTop(:), tnMax(:), Ac(:), repmat(R1, numel(deltaList), 1), repmat(R2, numel(deltaList), 1), Rc(:), R(:), ...
+            'VariableNames', {'delta_total_um','P_eff_Pa','Fz_top_int_N','Tn_max_Pa','Ac_m2','R1_ohm','R2_ohm','Rc_ohm','R_total_ohm'});
+        writetable(Traw, rawCsvPath);
+    end
 catch
 end
 
@@ -256,7 +308,11 @@ else
     fprintf(fid, "P_eff_coverage_Pa: [NaN, NaN]\n");
 end
 fprintf(fid, "interp_status: %s\n", interpStatus);
-fprintf(fid, "raw_csv: %s\n", rawCsvPath);
+if usePressureSweep
+    fprintf(fid, "raw_csv: %s\n", rpPressureCsvPath);
+else
+    fprintf(fid, "raw_csv: %s\n", rawCsvPath);
+end
 fprintf(fid, "interp_csv: %s\n", interpCsvPath);
 fclose(fid);
 end
