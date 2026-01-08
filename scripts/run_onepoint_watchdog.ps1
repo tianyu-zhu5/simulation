@@ -89,6 +89,57 @@ function Write-Heartbeat([string]$reason = "heartbeat") {
   Add-Content -Path $hbPath -Value $line -Encoding UTF8
 }
 
+$script:KnownOutDir = $null
+$script:LastSeenStatus = "NA"
+$script:LastSeenTarget = "NA"
+$script:LastSeenMode = "NA"
+
+function Write-WatchdogKillArtifacts([string]$outDir, [int]$timeoutSec) {
+  $ts = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ss")
+
+  $errPath = Join-Path $outDir "errors.json"
+  if (Test-Path $errPath) {
+    $bak = Join-Path $outDir ("errors_matlab_pre_watchdog_{0}.json" -f ($ts -replace "[:T-]", ""))
+    try { Copy-Item -Path $errPath -Destination $bak -Force -ErrorAction SilentlyContinue } catch {}
+  }
+
+  $targetNum = $null
+  try { $targetNum = [double]$script:LastSeenTarget } catch { $targetNum = $null }
+
+  $payload = [ordered]@{
+    exit_status          = "KILLED_BY_WATCHDOG"
+    target_delta_total_um = $targetNum
+    attempt_mode         = [string]$script:LastSeenMode
+    last_seen_status     = [string]$script:LastSeenStatus
+    killed_at_iso        = $ts
+    timeout_sec          = $timeoutSec
+  }
+
+  try {
+    ($payload | ConvertTo-Json -Depth 6) | Set-Content -Path $errPath -Encoding UTF8
+  } catch {}
+
+  # Append kill info to summary if present; otherwise write a dedicated watchdog summary.
+  $summaryPath = Join-Path $outDir "Pyramid_5x5_summary.txt"
+  $summaryWatchdogPath = Join-Path $outDir "summary_watchdog.txt"
+  $lines = @(
+    "",
+    "WatchdogKill:",
+    ("  exit_status: {0}" -f $payload.exit_status),
+    ("  target_delta_total_um: {0}" -f $payload.target_delta_total_um),
+    ("  attempt_mode: {0}" -f $payload.attempt_mode),
+    ("  last_seen_status: {0}" -f $payload.last_seen_status),
+    ("  killed_at_iso: {0}" -f $payload.killed_at_iso),
+    ("  timeout_sec: {0}" -f $payload.timeout_sec)
+  )
+
+  if (Test-Path $summaryPath) {
+    try { Add-Content -Path $summaryPath -Value $lines -Encoding UTF8 } catch {}
+  } else {
+    try { Set-Content -Path $summaryWatchdogPath -Value $lines -Encoding UTF8 } catch {}
+  }
+}
+
 $ResumeFromDir = Normalize-Dir $ResumeFromDir
 
 Write-Host "== run_onepoint_watchdog =="
@@ -160,7 +211,20 @@ try {
   }
 
   Write-Host ("TIMEOUT: exceeded {0}s, killing MATLAB + started COMSOL server..." -f $TimeoutSec)
+
+  # Refresh out_dir + last-seen status one last time before kill, and persist kill artifacts into out_dir.
   Write-Heartbeat ("KILLED")
+  if ($null -eq $knownOutDir -or -not (Test-Path $knownOutDir)) {
+    $od = Try-FindOutDir $script:StartTime
+    if ($null -ne $od) { $knownOutDir = $od }
+  }
+  if ($null -ne $knownOutDir -and (Test-Path $knownOutDir)) {
+    $script:KnownOutDir = $knownOutDir
+    $script:LastSeenStatus = $lastSeenStatus
+    $script:LastSeenTarget = $lastSeenTarget
+    $script:LastSeenMode = $lastSeenMode
+    Write-WatchdogKillArtifacts $knownOutDir $TimeoutSec
+  }
 
   if ($null -ne $p) {
     try { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue } catch {}
