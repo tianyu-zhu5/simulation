@@ -46,14 +46,10 @@ PloadKPa = numeric_env('SIM_P_LOAD_KPA', 0.6);
 tnEpsPa = numeric_env('SIM_TN_EPS_PA', 1.0);
 contactMode = get_env_or_default('PHASE2_CONTACT_MODE', 'augmented_lagrange');
 linearSolverMode = get_env_or_default('SIM_LINEAR_SOLVER_MODE', 'direct_pardiso');
-disableSegregated = true;
-try
-    ds = getenv('SIM_DISABLE_SEGREGATED');
-    if ~isempty(strtrim(ds))
-        disableSegregated = strcmpi(strtrim(ds), '1') || strcmpi(strtrim(ds), 'true');
-    end
-catch
-end
+solverCoupling = get_env_or_default('SIM_SOLVER_COUPLING', 'fully_coupled');
+disableSegregated = strcmpi(strtrim(solverCoupling), 'fully_coupled') || strcmpi(strtrim(solverCoupling), 'fully');
+maxSegIter = numeric_env('SIM_MAXSEGITER', 6);
+maxSubIter = numeric_env('SIM_MAXSUBITER', 4);
 
 fid = fopen(summaryPath, 'w', 'n', 'UTF-8');
 fprintf(fid, "summary_stage: START\n");
@@ -62,7 +58,10 @@ fprintf(fid, "resume_checkpoint: %s\n", string(ckIn));
 fprintf(fid, "P_load_kPa: %.6g\n", PloadKPa);
 fprintf(fid, "contact_mode_requested: %s\n", string(contactMode));
 fprintf(fid, "linear_solver_mode_requested: %s\n", string(linearSolverMode));
+fprintf(fid, "solver_coupling: %s\n", string(solverCoupling));
 fprintf(fid, "disable_segregated: %d\n", disableSegregated);
+fprintf(fid, "segregated_maxsegiter: %g\n", maxSegIter);
+fprintf(fid, "segregated_maxsubiter: %g\n", maxSubIter);
 fclose(fid);
 
 write_metrics_pressure_header(metricsPath);
@@ -142,16 +141,30 @@ end
 segDisabled = false;
 segNote = 'none';
 try
+    s1 = model.sol('sol1').feature('s1');
+    se1 = s1.feature('se1');
     if disableSegregated
-        s1 = model.sol('sol1').feature('s1');
         try
-            s1.feature('se1').active(false);
+            se1.active(false);
             segDisabled = true;
-            segNote = 'sol1/s1/se1 deactivated';
+            segNote = 'sol1/s1/se1 deactivated (fully_coupled requested)';
         catch ME
             segDisabled = false;
             segNote = string(ME.message);
         end
+    else
+        % Fail-fast but returning: cap segregated outer iterations and inner nonlinear iterations.
+        try, se1.active(true); catch, end
+        try, se1.set('maxsegiter', maxSegIter); catch, end
+        try
+            ss1 = se1.feature('ss1');
+            try, ss1.set('maxsubiter', maxSubIter); catch, end
+            % Prefer Direct solver for segregated step if possible.
+            try, ss1.set('linsolver', 'dDef'); catch, end
+        catch
+        end
+        segDisabled = false;
+        segNote = sprintf('sol1/s1/se1 active; maxsegiter=%g, maxsubiter=%g', maxSegIter, maxSubIter);
     end
 catch ME
     segDisabled = false;
@@ -204,6 +217,7 @@ fprintf(fid, "disp_top_xy_only_ok: %d\n", dispTopOk);
 fprintf(fid, "pressure_load_ok: %d\n", pressureOk);
 fprintf(fid, "segregated_disabled: %d\n", segDisabled);
 fprintf(fid, "segregated_note: %s\n", sanitize_csv_text(string_or_none(segNote)));
+fprintf(fid, "solver_coupling: %s\n", sanitize_csv_text(string_or_none(solverCoupling)));
 fprintf(fid, "linear_solver_mode: %s\n", sanitize_csv_text(string_or_none(linearSolverMode)));
 fprintf(fid, "linear_solver_switched: %d\n", tern(linearSwitched,1,0));
 fprintf(fid, "linear_solver_note: %s\n", sanitize_csv_text(string_or_none(linearNote)));
@@ -666,4 +680,3 @@ t = replace(t, newline, ' ');
 t = replace(t, char(13), ' ');
 t = replace(t, ',', ';');
 end
-

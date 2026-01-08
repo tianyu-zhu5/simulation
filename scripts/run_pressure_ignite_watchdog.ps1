@@ -13,6 +13,10 @@ param(
   [string]$LinearSolverMode = "direct_pardiso",
 
   [Parameter(Mandatory = $false)]
+  [ValidateSet("fully_coupled","segregated")]
+  [string]$SolverCoupling = "segregated",
+
+  [Parameter(Mandatory = $false)]
   [int]$TimeoutSec = 900,
 
   [Parameter(Mandatory = $false)]
@@ -86,7 +90,7 @@ $env:SIM_P_LOAD_KPA = ([string]$PloadKPa)
 $env:PHASE2_CONTACT_MODE = $ContactMode
 $env:SIM_LINEAR_SOLVER_MODE = $LinearSolverMode
 $env:SIM_TN_EPS_PA = "1"
-$env:SIM_DISABLE_SEGREGATED = "1"
+$env:SIM_SOLVER_COUPLING = $SolverCoupling
 
 $p = Start-Process -FilePath "matlab" -ArgumentList @("-batch","run_pyramid_array_5x5_pressure_ignite") -PassThru -NoNewWindow
 Write-Host ("MATLAB PID: {0}" -f $p.Id)
