@@ -55,7 +55,9 @@ function Write-Heartbeat([string]$hbPath, [string]$reason, [string]$outDir) {
   $ts = IsoNow
   $st = "NA"
   if ($outDir -and (Test-Path $outDir)) { $st = Read-IgniteStatus $outDir }
-  $line = "{0} {1} exit_status={2} out_dir={3}" -f $ts, $reason, $st, ($outDir ? $outDir : "NA")
+  $outDirStr = "NA"
+  if ($outDir -and $outDir.Trim() -ne "") { $outDirStr = $outDir }
+  $line = "{0} {1} exit_status={2} out_dir={3}" -f $ts, $reason, $st, $outDirStr
   Add-Content -Path $hbPath -Value $line -Encoding UTF8
 }
 
@@ -149,4 +151,3 @@ Write-Heartbeat $hbPath "ENDED" $knownOutDir
 Write-Host "MATLAB finished within timeout."
 if ($knownOutDir) { Write-Host ("OutDir: {0}" -f $knownOutDir) }
 exit 0
-
