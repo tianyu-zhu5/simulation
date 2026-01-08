@@ -35,8 +35,8 @@ function Normalize-Dir([string]$p) {
 function Try-FindOutDir([datetime]$startTime) {
   $root = Join-Path (Get-Location).Path "out\\pyramid_5x5"
   if (-not (Test-Path $root)) { return $null }
-  $dirs = Get-ChildItem $root -Directory -Filter "pressure_ignite_*" | Where-Object { $_.LastWriteTime -ge $startTime.AddSeconds(-2) } | Sort-Object LastWriteTime -Descending
-  if ($dirs.Count -gt 0) { return $dirs[0].FullName }
+  $dirs = @(Get-ChildItem $root -Directory -Filter "pressure_ignite_*" | Where-Object { $_.LastWriteTime -ge $startTime.AddSeconds(-2) } | Sort-Object LastWriteTime -Descending)
+  if ($dirs.Length -gt 0) { return $dirs[0].FullName }
   return $null
 }
 
