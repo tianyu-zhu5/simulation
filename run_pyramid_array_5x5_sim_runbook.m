@@ -72,6 +72,14 @@ end
 model = mphload(modelSource);
 model.hist.disable();
 
+% Optional: switch linear solver mode (e.g. force Direct(PARDISO)) for this run.
+try
+    [linearSolverSwitched, linearSolverNote] = configure_linear_solver_mode(model, linearSolverMode);
+catch ME
+    linearSolverSwitched = false;
+    linearSolverNote = string(ME.message);
+end
+
 comp = model.component('comp1');
 solid = comp.physics('solid');
 
@@ -188,6 +196,9 @@ meshMinQuality = NaN;
 meshInvertedElements = NaN;
 meshCountQualLt0p1 = NaN;
 meshCountQualLt0p01 = NaN;
+linearSolverMode = get_env_or_default('SIM_LINEAR_SOLVER_MODE', 'default');
+linearSolverSwitched = false;
+linearSolverNote = 'none';
 contactMode = get_env_or_default('PHASE2_CONTACT_MODE', 'penalty_soft');
 contactModeRequested = contactMode;
 nuMode = get_env_or_default('PHASE2_NU_MODE', 'prod');
@@ -514,6 +525,9 @@ fprintf(fid, "mesh_min_quality: %s\n", num2str(meshMinQuality));
 fprintf(fid, "mesh_inverted_elements: %s\n", num2str(meshInvertedElements));
 fprintf(fid, "mesh_count_quality_lt_0_1: %s\n", num2str(meshCountQualLt0p1));
 fprintf(fid, "mesh_count_quality_lt_0_01: %s\n", num2str(meshCountQualLt0p01));
+fprintf(fid, "linear_solver_mode: %s\n", string_or_none(linearSolverMode));
+fprintf(fid, "linear_solver_switched: %d\n", tern(linearSolverSwitched, 1, 0));
+fprintf(fid, "linear_solver_note: %s\n", string_or_none(linearSolverNote));
 try, fprintf(fid, "Lpyr: %s\n", char(model.param.get('Lpyr'))); catch, end
 fprintf(fid, "delta_base_um: %g\n", deltaBaseUm);
 fprintf(fid, "delta_indent_list_um: %s\n", mat2str(deltaIndentUm));
@@ -2445,6 +2459,85 @@ try
         ok = true;
         return;
     end
+catch
+end
+end
+
+function [switched, note] = configure_linear_solver_mode(model, mode)
+% Best-effort linear solver switch for this run (does not change physics).
+%
+% Supported modes:
+% - 'default' (no changes)
+% - 'direct_pardiso' (force Direct solver nodes to use PARDISO where available)
+switched = false;
+note = 'none';
+mm = lower(strtrim(string(mode)));
+if mm == "" || mm == "default" || mm == "none"
+    return;
+end
+if mm ~= "direct_pardiso"
+    note = "unknown linear solver mode";
+    return;
+end
+
+try
+    soltags = cell(model.sol.tags);
+catch
+    soltags = {};
+end
+
+setCount = 0;
+for i = 1:numel(soltags)
+    try
+        sol = model.sol(soltags{i});
+        ftags = cell(sol.feature.tags);
+    catch
+        continue;
+    end
+    for j = 1:numel(ftags)
+        try
+            top = sol.feature(ftags{j});
+        catch
+            continue;
+        end
+        setCount = setCount + set_direct_solver_pardiso(top);
+        try
+            subtags = cell(top.feature.tags);
+        catch
+            subtags = {};
+        end
+        for k = 1:numel(subtags)
+            try
+                sub = top.feature(subtags{k});
+                setCount = setCount + set_direct_solver_pardiso(sub);
+            catch
+            end
+        end
+    end
+end
+
+if setCount > 0
+    switched = true;
+    note = sprintf('set PARDISO on %d Direct solver node(s)', setCount);
+else
+    switched = false;
+    note = 'no Direct solver nodes were updated (PARDISO not available?)';
+end
+end
+
+function n = set_direct_solver_pardiso(feat)
+n = 0;
+try
+    t = char(feat.getType());
+catch
+    t = '';
+end
+if ~strcmpi(t, 'Direct')
+    return;
+end
+try
+    feat.set('linsolver', 'pardiso');
+    n = 1;
 catch
 end
 end
