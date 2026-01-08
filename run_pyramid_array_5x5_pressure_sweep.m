@@ -42,67 +42,108 @@ linearSolverMode = get_env_or_default('SIM_LINEAR_SOLVER_MODE', 'default');
 contactMode = get_env_or_default('PHASE2_CONTACT_MODE', 'augmented_lagrange');
 tnEpsPa = numeric_env('SIM_TN_EPS_PA', 1.0);
 
-pointKpaEnv = getenv('SIM_P_LOAD_KPA');
-if ~isempty(pointKpaEnv)
-    PkPaList = str2double(pointKpaEnv);
-    if ~isfinite(PkPaList)
-        error('Invalid SIM_P_LOAD_KPA: %s', pointKpaEnv);
+% Pressure list (kPa). Default uses a gentle ramp to help continuation start:
+%   0.01, 0.05, 0.1, 0.2, 0.3 kPa
+% Override with SIM_P_LOAD_LIST_KPA="0.01,0.05,0.1" etc.
+listEnv = getenv('SIM_P_LOAD_LIST_KPA');
+if ~isempty(strtrim(listEnv))
+    parts = split(string(listEnv), {',',';',' ','\t'});
+    parts = parts(parts ~= "");
+    PkPaList = nan(size(parts));
+    for iP = 1:numel(parts)
+        PkPaList(iP) = str2double(parts(iP));
+    end
+    if any(~isfinite(PkPaList))
+        error('Invalid SIM_P_LOAD_LIST_KPA: %s', listEnv);
     end
 else
-    PkPaList = [0.3, 0.6, 1.0];
+    PkPaList = [0.01, 0.05, 0.1, 0.2, 0.3];
 end
+
+% Per-point soft timeout (seconds): record FAIL_SOFT_TIMEOUT if the solve returns but exceeds this.
+% NOTE: This is a logging/triage threshold; it cannot interrupt a running COMSOL solve.
+softTimeoutS = numeric_env('SIM_PRESSURE_SOFT_TIMEOUT_S', 180);
 
 write_metrics_pressure_header(metricsPath);
 
+model = mphload(tpl);
+model.hist.disable();
+
+switched = false;
+switchNote = 'none';
+try
+    [switched, switchNote] = configure_linear_solver_mode(model, linearSolverMode);
+catch ME
+    switched = false;
+    switchNote = string(ME.message);
+end
+
+comp = model.component('comp1');
+solid = comp.physics('solid');
+pc = comp.pair('pc');
+
+% Enforce dcnt1-only and bind to pair 'pc'.
+try
+    enforce_dcnt1_only(solid, 'dcnt1', 'cnt1', 'pc');
+catch
+end
+
+% Apply contact preset.
+contactSupported = true;
+contactEffective = contactMode;
+contactNote = 'none';
+try
+    dcnt = solid.feature('dcnt1');
+    [contactSupported, contactEffective, contactNote] = apply_contact_mode(dcnt, 'dcnt1', contactMode, 1.0, 1.0);
+catch ME
+    contactSupported = false;
+    contactNote = string(ME.message);
+end
+
+% Boundary selections
+bnd_rigid_top = solid.feature('bndl1').selection.entities;
+bnd_eval = pc.destination.entities;
+
+% Pressure load on the rigid plate top: use P_load parameter (kPa).
+try
+    bndl = solid.feature('bndl1');
+    bndl.set('forceType', 'FollowerPressure');
+    bndl.set('pressure', '-P_load'); % push along -z
+    bndl.active(true);
+catch
+end
+
+% Disable displacement-control in z; keep x/y locked to avoid lateral rigid motion.
+try, solid.feature('disp_top').active(true); catch, end
+try
+    solid.feature('disp_top').set('Direction', {'prescribed','prescribed','free'});
+    solid.feature('disp_top').set('U0', {'0','0','0'});
+catch
+end
+try, model.param.set('delta', '0[um]'); catch, end
+
+% Study (stationary) settings + PTC configuration.
+st = model.study('std1').feature('stat');
+try, st.set('geometricNonlinearity', 'on'); catch, end
+try, st.set('geometricNonlinearityActive', 'on'); catch, end
+try, st.set('useparam', 'off'); catch, end
+try, st.set('initmethod', 'sol'); catch, end
+try, st.set('initsol', 'current'); catch, end
+try, st.set('useinitsol', 'off'); catch, end
+
+ptcTimeStep = numeric_env('SIM_PTC_DT', 0.05);
+ptcMaxSteps = numeric_env('SIM_PTC_MAX_STEPS', 80);
+ptcDamping = numeric_env('SIM_PTC_DAMPING', 0.5);
+try
+    configure_ptc_solver(model, ptcTimeStep, ptcMaxSteps, ptcDamping);
+catch
+end
+
+hasSol = false;
 for i = 1:numel(PkPaList)
     PkPa = PkPaList(i);
     attemptTag = pressure_tag(PkPa);
     pointT0 = tic;
-
-    % Best-effort resume from last successful checkpoint within this sweepDir.
-    modelSource = tpl;
-    ckLastOk = fullfile(sweepDir, 'checkpoint_last_ok.mph');
-    if exist(ckLastOk, 'file')
-        modelSource = ckLastOk;
-    end
-
-    model = mphload(modelSource);
-    model.hist.disable();
-
-    switched = false;
-    switchNote = 'none';
-    try
-        [switched, switchNote] = configure_linear_solver_mode(model, linearSolverMode);
-    catch ME
-        switched = false;
-        switchNote = string(ME.message);
-    end
-
-    comp = model.component('comp1');
-    solid = comp.physics('solid');
-    pc = comp.pair('pc');
-
-    % Enforce dcnt1-only and bind to pair 'pc'.
-    try
-        enforce_dcnt1_only(solid, 'dcnt1', 'cnt1', 'pc');
-    catch
-    end
-
-    % Apply contact preset.
-    contactSupported = true;
-    contactEffective = contactMode;
-    contactNote = 'none';
-    try
-        dcnt = solid.feature('dcnt1');
-        [contactSupported, contactEffective, contactNote] = apply_contact_mode(dcnt, 'dcnt1', contactMode, 1.0, 1.0);
-    catch ME
-        contactSupported = false;
-        contactNote = string(ME.message);
-    end
-
-    % Boundary selections
-    bnd_rigid_top = solid.feature('bndl1').selection.entities;
-    bnd_eval = pc.destination.entities;
 
     % Pressure load on the rigid plate top: use P_load parameter (kPa).
     try
@@ -113,40 +154,8 @@ for i = 1:numel(PkPaList)
         catch
         end
     end
-    try
-        bndl = solid.feature('bndl1');
-        bndl.set('forceType', 'FollowerPressure');
-        % Apply negative sign to push along -z (for typical +z top-face normal).
-        bndl.set('pressure', '-P_load');
-        bndl.active(true);
-    catch
-    end
-
-    % Disable displacement-control in z; keep x/y locked to avoid lateral rigid motion.
-    try, solid.feature('disp_top').active(true); catch, end
-    try
-        solid.feature('disp_top').set('Direction', {'prescribed','prescribed','free'});
-        solid.feature('disp_top').set('U0', {'0','0','0'});
-    catch
-    end
-    try, model.param.set('delta', '0[um]'); catch, end
-
-    % Study (stationary) settings + PTC configuration.
-    st = model.study('std1').feature('stat');
-    try, st.set('geometricNonlinearity', 'on'); catch, end
-    try, st.set('geometricNonlinearityActive', 'on'); catch, end
-    try, st.set('useparam', 'off'); catch, end
-    try, st.set('initmethod', 'sol'); catch, end
-    try, st.set('initsol', 'current'); catch, end
-    try, st.set('useinitsol', 'on'); catch, end
-
-    ptcTimeStep = numeric_env('SIM_PTC_DT', 0.05);
-    ptcMaxSteps = numeric_env('SIM_PTC_MAX_STEPS', 80);
-    ptcDamping = numeric_env('SIM_PTC_DAMPING', 0.5);
-    try
-        configure_ptc_solver(model, ptcTimeStep, ptcMaxSteps, ptcDamping);
-    catch
-    end
+    % Continuation: use previous converged solution as initial values when available.
+    try, st.set('useinitsol', tern(hasSol,'on','off')); catch, end
 
     ok = false;
     errMsg = 'none';
@@ -158,6 +167,9 @@ for i = 1:numel(PkPaList)
         errMsg = string(ME.message);
     end
     elapsedS = toc(pointT0);
+    if ok
+        hasSol = true;
+    end
 
     ATop = NaN;
     Fz = NaN;
@@ -178,9 +190,17 @@ for i = 1:numel(PkPaList)
         end
     end
 
-    append_metrics_pressure_row(metricsPath, PkPa, PEff, Fz, ATop, Ac, tnMax, pnAvg, acWhy, ok, errMsg, elapsedS, linearSolverMode, switched, switchNote, contactMode, contactEffective, contactSupported, contactNote);
+    okOut = ok;
+    failOut = errMsg;
+    if ok && isfinite(softTimeoutS) && softTimeoutS > 0 && elapsedS > softTimeoutS
+        okOut = false;
+        failOut = sprintf('FAIL_SOFT_TIMEOUT_RETURNED (elapsed=%.1fs > soft_timeout=%.1fs)', elapsedS, softTimeoutS);
+    end
+
+    append_metrics_pressure_row(metricsPath, PkPa, PEff, Fz, ATop, Ac, tnMax, pnAvg, acWhy, okOut, failOut, elapsedS, linearSolverMode, switched, switchNote, contactMode, contactEffective, contactSupported, contactNote);
 
     % Save checkpoints (optional; do not commit to git).
+    ckLastOk = fullfile(sweepDir, 'checkpoint_last_ok.mph');
     if ok
         try
             ckPoint = fullfile(sweepDir, sprintf('checkpoint_%s.mph', attemptTag));
@@ -212,9 +232,8 @@ for i = 1:numel(PkPaList)
         catch
         end
     end
-
-    try, ModelUtil.remove('model'); catch, end %#ok<TRYNC>
 end
+try, ModelUtil.remove('model'); catch, end %#ok<TRYNC>
 end
 
 function write_metrics_pressure_header(path)
@@ -591,4 +610,3 @@ t = replace(t, newline, ' ');
 t = replace(t, char(13), ' ');
 t = replace(t, ',', ';');
 end
-
