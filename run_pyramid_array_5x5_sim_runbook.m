@@ -91,26 +91,27 @@ solid = comp.physics('solid');
 % Representative geometry (keep Lpyr fixed for now; sweep later)
 try, model.param.set('Lpyr', '10[um]'); catch, end
 
-% Phase3.5-A: increase tip truncation (geometry-only).
-% Apply even in RESUME mode; if rat_tip changes, rebuild geometry to keep model consistent.
-ratTipWanted = numeric_env('SIM_RAT_TIP', NaN);
-if ~isfinite(ratTipWanted)
-    ratTipWanted = 0.25;
-end
+% Optional: adjust tip truncation (geometry-only). Default is KEEP-AS-IS unless SIM_RAT_TIP is set.
 ratTipPrev = NaN;
 try, ratTipPrev = model.param.evaluate('rat_tip'); catch, end
+ratTipWanted = numeric_env('SIM_RAT_TIP', NaN);
+ratTipExplicit = isfinite(ratTipWanted);
 ratTipChanged = false;
 ratTipGeomRebuilt = false;
-if isfinite(ratTipPrev) && abs(ratTipPrev - ratTipWanted) > 1e-12
-    ratTipChanged = true;
-end
-try, model.param.set('rat_tip', sprintf('%.6g', ratTipWanted)); catch, end
-if ratTipChanged
-    try
-        comp.geom('geom1').run;
-        ratTipGeomRebuilt = true;
-    catch
-        ratTipGeomRebuilt = false;
+if ~ratTipExplicit
+    ratTipWanted = ratTipPrev; % for summary only
+else
+    if isfinite(ratTipPrev) && abs(ratTipPrev - ratTipWanted) > 1e-12
+        ratTipChanged = true;
+    end
+    if ratTipChanged
+        try, model.param.set('rat_tip', sprintf('%.6g', ratTipWanted)); catch, end
+        try
+            comp.geom('geom1').run;
+            ratTipGeomRebuilt = true;
+        catch
+            ratTipGeomRebuilt = false;
+        end
     end
 end
 
