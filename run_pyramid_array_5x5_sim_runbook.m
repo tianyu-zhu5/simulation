@@ -2480,6 +2480,28 @@ if mm ~= "direct_pardiso"
     return;
 end
 
+% Fast path for this model: sol1/s1/dDef is the default Direct node (often MUMPS).
+try
+    dDef = model.sol('sol1').feature('s1').feature('dDef');
+    try
+        dDef.set('linsolver', 'pardiso');
+        try
+            v = char(dDef.getString('linsolver'));
+            if strcmpi(strtrim(v), 'pardiso')
+                switched = true;
+                note = 'sol1/s1/dDef linsolver=pardiso';
+                return;
+            end
+        catch
+            switched = true;
+            note = 'sol1/s1/dDef linsolver set to pardiso (unverified)';
+            return;
+        end
+    catch
+    end
+catch
+end
+
 try
     soltags = cell(model.sol.tags);
 catch
