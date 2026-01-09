@@ -1273,7 +1273,20 @@ geomTag = "geom1";
 % Find points adjacent to top boundary selection (best-effort).
 vtx = [];
 try
-    vtx = mphgetadj(model, geomTag, 'boundary', 'point', bndRigidTop);
+    % NOTE: mphgetadj signature is (returntype, adjtype, adjnumber).
+    % We want points adjacent to boundary entities.
+    % Some LiveLink versions don't reliably accept an array for ADJNUMBER, so union per-boundary.
+    vtxAll = [];
+    for k = 1:numel(bndRigidTop)
+        b = bndRigidTop(k);
+        try
+            vtxK = mphgetadj(model, geomTag, 'point', 'boundary', b);
+            vtxAll = [vtxAll, vtxK(:)']; %#ok<AGROW>
+        catch
+            % continue best-effort
+        end
+    end
+    vtx = unique(vtxAll);
 catch ME
     note = "mphgetadj_failed:" + string(ME.message);
     return;
