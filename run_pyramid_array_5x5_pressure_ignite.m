@@ -8,6 +8,7 @@ function run_pyramid_array_5x5_pressure_ignite()
 % - Switching to fully-coupled (disable segregated) + Direct(PARDISO) linear solver
 % - Producing a single-row metrics file for RP: Ac(P), etc.
 % - Ignite-v2: optional pressure ramp s=0.25->1.0 and fully-coupled path
+% - Ignite-v3: two-stage (single then ramp), custom ramp list, robust FC options, and internal budget
 %
 % Outputs:
 %   out/pyramid_5x5/pressure_ignite_YYYYMMDD_HHMMSS/metrics_pressure.csv
@@ -50,10 +51,32 @@ linearSolverMode = get_env_or_default('SIM_LINEAR_SOLVER_MODE', 'direct_pardiso'
 solverCoupling = get_env_or_default('SIM_SOLVER_COUPLING', 'segregated');
 igniteRamp = numeric_env('SIM_IGNITE_RAMP', 0);
 
+igniteRampListStr = get_env_or_default('SIM_IGNITE_RAMP_LIST', '');
+igniteRampDefaultMode = get_env_or_default('SIM_IGNITE_RAMP_DEFAULT_MODE', 'legacy');
+igniteTwoStage = numeric_env('SIM_IGNITE_TWO_STAGE', 0);
+igniteBudgetS = numeric_env('SIM_IGNITE_BUDGET_S', 1500);
+
+fcMode = get_env_or_default('SIM_FC_MODE', 'fast_fail');
+fcMaxIterFast = numeric_env('SIM_FC_MAXITER_FAST', 12);
+fcMaxIterRobust = numeric_env('SIM_FC_MAXITER_ROBUST', 30);
+fcMaxIterOverride = numeric_env('SIM_FC_MAXITER', NaN); % backwards-compat override
+fcDampedRequested = numeric_env('SIM_FC_DAMPED', 0);
+fcLineSearchRequested = numeric_env('SIM_FC_LINESEARCH', 0);
+stabilizationRequested = numeric_env('SIM_SOLVER_STABILIZATION', 0);
+
 disableSegregated = strcmpi(strtrim(solverCoupling), 'fully_coupled') || strcmpi(strtrim(solverCoupling), 'fully');
 maxSegIter = numeric_env('SIM_MAXSEGITER', 6);
 maxSubIter = numeric_env('SIM_MAXSUBITER', 4);
-fcMaxIter = numeric_env('SIM_FC_MAXITER', 12);
+if strcmpi(strtrim(fcMode), 'robust')
+    fcMaxIterTarget = fcMaxIterRobust;
+else
+    fcMaxIterTarget = fcMaxIterFast;
+end
+if isfinite(fcMaxIterOverride)
+    fcMaxIterTarget = fcMaxIterOverride;
+end
+
+runId = datestr(now, 'yyyymmdd_HHMMSS');
 
 fid = fopen(summaryPath, 'w', 'n', 'UTF-8');
 fprintf(fid, "summary_stage: START\n");
@@ -64,14 +87,24 @@ fprintf(fid, "contact_mode_requested: %s\n", string(contactMode));
 fprintf(fid, "linear_solver_mode_requested: %s\n", string(linearSolverMode));
 fprintf(fid, "solver_coupling: %s\n", string(solverCoupling));
 fprintf(fid, "ignite_ramp_enabled: %d\n", tern(igniteRamp > 0.5, 1, 0));
+fprintf(fid, "ignite_ramp_list_str: %s\n", string_or_none(igniteRampListStr));
+fprintf(fid, "ignite_ramp_default_mode: %s\n", string_or_none(igniteRampDefaultMode));
+fprintf(fid, "ignite_two_stage: %d\n", tern(igniteTwoStage > 0.5, 1, 0));
+fprintf(fid, "ignite_budget_s: %g\n", igniteBudgetS);
 fprintf(fid, "disable_segregated: %d\n", disableSegregated);
 fprintf(fid, "segregated_maxsegiter: %g\n", maxSegIter);
 fprintf(fid, "segregated_maxsubiter: %g\n", maxSubIter);
-fprintf(fid, "fully_coupled_maxiter: %g\n", fcMaxIter);
+fprintf(fid, "fc_mode: %s\n", string_or_none(fcMode));
+fprintf(fid, "fc_maxiter_target: %g\n", fcMaxIterTarget);
+fprintf(fid, "fc_damped_requested: %d\n", tern(fcDampedRequested > 0.5, 1, 0));
+fprintf(fid, "fc_linesearch_requested: %d\n", tern(fcLineSearchRequested > 0.5, 1, 0));
+fprintf(fid, "stabilization_requested: %d\n", tern(stabilizationRequested > 0.5, 1, 0));
+fprintf(fid, "run_id: %s\n", string(runId));
 fclose(fid);
 
 write_metrics_pressure_header(metricsPath);
 
+runT0 = tic;
 model = mphload(ckIn);
 model.hist.disable();
 
@@ -143,14 +176,27 @@ segNote = 'none';
 fcEnabled = false;
 fcNote = 'none';
 fcMaxIterSet = NaN;
+fcDampedEffective = false;
+fcDampedNote = 'none';
+fcLineSearchEffective = false;
+fcLineSearchNote = 'none';
+stabilizationEffective = false;
+stabilizationNote = 'none';
 try
-    [segDisabled, segNote, fcEnabled, fcNote, fcMaxIterSet] = configure_solver_coupling(model, solverCoupling, maxSegIter, maxSubIter, fcMaxIter);
+    [segDisabled, segNote, fcEnabled, fcNote, fcMaxIterSet, fcDampedEffective, fcDampedNote, fcLineSearchEffective, fcLineSearchNote, stabilizationEffective, stabilizationNote] = ...
+        configure_solver_coupling(model, solverCoupling, maxSegIter, maxSubIter, fcMaxIterTarget, fcMode, fcDampedRequested > 0.5, fcLineSearchRequested > 0.5, stabilizationRequested > 0.5);
 catch ME
     segDisabled = false;
     segNote = string(ME.message);
     fcEnabled = false;
     fcNote = string(ME.message);
     fcMaxIterSet = NaN;
+    fcDampedEffective = false;
+    fcDampedNote = string(ME.message);
+    fcLineSearchEffective = false;
+    fcLineSearchNote = string(ME.message);
+    stabilizationEffective = false;
+    stabilizationNote = string(ME.message);
 end
 
 % Ensure we actually use initial values from the loaded checkpoint.
@@ -159,93 +205,204 @@ try, st.set('initmethod', 'sol'); catch, end
 try, st.set('initsol', 'current'); catch, end
 try, st.set('useinitsol', 'on'); catch, end
 
-% Ignite steps: either one shot (s=1.0) or a ramp s=[0.25 0.5 0.75 1.0]
-if igniteRamp > 0.5
-    sList = [0.25, 0.5, 0.75, 1.0];
+% Ignite-v3 step planning:
+% - optional two-stage: first try s=1.0 once; only if that fails, run ramp list
+% - ramp list can be overridden; default behavior remains legacy unless explicitly requested
+[sRamp, sRampNote] = resolve_ramp_list(igniteRamp > 0.5, igniteRampListStr, igniteRampDefaultMode);
+
+fid = fopen(summaryPath, 'a', 'n', 'UTF-8');
+fprintf(fid, "ramp_list_effective_s: %s\n", s_list_to_string(sRamp));
+fprintf(fid, "ramp_list_note: %s\n", sanitize_csv_text(string_or_none(sRampNote)));
+fclose(fid);
+
+budgetS = igniteBudgetS;
+if ~isfinite(budgetS) || budgetS <= 0
+    budgetS = inf;
+end
+budgetMinNextS = 60;
+
+steps = struct('stage', {}, 'step_index', {}, 's', {}, 'P_load_kPa', {}, 'start_time_iso', {}, 'end_time_iso', {}, 'elapsed_s', {}, 'exit_status', {}, 'reason', {}, 'comsol_message_excerpt', {}, 'checkpoint_saved', {});
+hadAnySuccess = false;
+lastOkGlobal = 0;
+lastOkStage = "none";
+lastOkS = NaN;
+lastOkP = NaN;
+stage1Failed = false;
+stage1FailReason = "none";
+failReason = "none";
+failStage = "none";
+failStepIdx = NaN;
+failS = NaN;
+failP = NaN;
+stopReason = "none";
+
+% Stage sequencing
+stagePlan = {};
+if igniteTwoStage > 0.5
+    stagePlan = {'single','ramp'};
 else
-    sList = 1.0;
+    if igniteRamp > 0.5
+        stagePlan = {'ramp'};
+    else
+        stagePlan = {'single'};
+    end
 end
 
-exitStatus = "FAIL";
-lastOkStepIdx = 0;
-stepFailReason = "none";
-stepFailIdx = NaN;
-stepFailS = NaN;
-stepFailP = NaN;
-
-for stepIdx = 1:numel(sList)
-    s = sList(stepIdx);
-    PstepKPa = PloadKPa * s;
-    stepT0 = tic;
-
-    fid = fopen(summaryPath, 'a', 'n', 'UTF-8');
-    fprintf(fid, "\nStepStart: idx=%d s=%.6g P_load_kPa=%.6g\n", stepIdx, s, PstepKPa);
-    fclose(fid);
-
-    % Set P_load for this step.
-    try
-        model.param.set('P_load', sprintf('%.6g[kPa]', PstepKPa));
-    catch
-        try, model.param.set('P_load', sprintf('%.6g*1e3[Pa]', PstepKPa)); catch, end
-    end
-
-    ok = false;
-    errMsg = 'none';
-    try
-        model.study('std1').run();
-        ok = true;
-    catch ME
-        ok = false;
-        errMsg = string(ME.message);
-    end
-    elapsedS = toc(stepT0);
-
-    ATop = NaN;
-    Fz = NaN;
-    PEff = NaN;
-    tnMax = NaN;
-    Ac = 0;
-    pnAvg = NaN;
-    acWhy = 'none';
-    checkpointSaved = false;
-    if ok
-        try, ATop = mphint2(model, '1', 'surface', 'selection', bnd_rigid_top); catch, end
-        try, Fz = mphint2(model, 'solid.RFz', 'surface', 'selection', bnd_rigid_top); catch, end
-        if isfinite(ATop) && ATop > 0 && isfinite(Fz)
-            PEff = abs(Fz) ./ ATop;
-        end
-        try
-            [tnMax, Ac, pnAvg, acWhy] = eval_contact_metrics_with_why(model, bnd_eval, tnEpsPa);
-        catch
-        end
-        try
-            model.save(checkpointOut);
-            checkpointSaved = true;
-        catch
-            checkpointSaved = false;
+globalStep = 0;
+for iStage = 1:numel(stagePlan)
+    stageName = string(stagePlan{iStage});
+    if stageName == "single"
+        sList = 1.0;
+    else
+        sList = sRamp;
+        if igniteTwoStage > 0.5
+            % Avoid duplicating s=1.0 after stage-1 already attempted.
+            sList = sList(abs(sList - 1.0) > 1e-12);
         end
     end
 
-    append_metrics_pressure_row(metricsPath, stepIdx, s, PstepKPa, PEff, Fz, ATop, Ac, tnMax, pnAvg, acWhy, ok, tern(ok,'SUCCESS','FAIL'), errMsg, elapsedS, ...
-        linearSolverMode, linearSwitched, linearNote, solverCoupling, segDisabled, segNote, fcEnabled, fcMaxIterSet, fcNote, contactMode, contactEffective, contactSupported, contactNote, checkpointSaved);
-
-    fid = fopen(summaryPath, 'a', 'n', 'UTF-8');
-    fprintf(fid, "StepEnd: idx=%d status=%s elapsed_s=%.6g checkpoint_saved=%d\n", stepIdx, tern(ok,'SUCCESS','FAIL'), elapsedS, tern(checkpointSaved,1,0));
-    fclose(fid);
-
-    if ok
-        lastOkStepIdx = stepIdx;
-        exitStatus = "SUCCESS";
+    if isempty(sList)
         continue;
     end
 
-    % First failed step => stop immediately (deterministic termination) after writing artifacts.
-    stepFailReason = errMsg;
-    stepFailIdx = stepIdx;
-    stepFailS = s;
-    stepFailP = PstepKPa;
-    exitStatus = "FAIL";
-    break;
+    % If stage-1 succeeded in two-stage, stop immediately (do not run ramp).
+    if igniteTwoStage > 0.5 && stageName == "ramp" && hadAnySuccess
+        break;
+    end
+
+    for stepIdx = 1:numel(sList)
+        globalStep = globalStep + 1;
+        s = sList(stepIdx);
+        PstepKPa = PloadKPa * s;
+        nowIso = datestr(now, 'yyyy-mm-ddTHH:MM:SS');
+
+        budgetRemainingBefore = budgetS - toc(runT0);
+        if budgetRemainingBefore < budgetMinNextS
+            stopReason = "BUDGET_EXCEEDED_BEFORE_STEP";
+            failReason = stopReason;
+            failStage = stageName;
+            failStepIdx = stepIdx;
+            failS = s;
+            failP = PstepKPa;
+
+            % Record a budget skip row (deterministic early exit).
+            append_metrics_pressure_row(metricsPath, globalStep, s, PstepKPa, NaN, NaN, NaN, 0, NaN, NaN, "none", false, "BUDGET_SKIP", stopReason, 0, ...
+                linearSolverMode, linearSwitched, linearNote, solverCoupling, segDisabled, segNote, fcEnabled, fcMaxIterSet, fcNote, contactMode, contactEffective, contactSupported, contactNote, false, ...
+                runId, stageName, fcMode, fcMaxIterTarget, fcDampedRequested > 0.5, fcDampedEffective, fcLineSearchRequested > 0.5, fcLineSearchEffective, stabilizationRequested > 0.5, stabilizationEffective, budgetS, budgetRemainingBefore);
+
+            steps(end+1) = make_step(stageName, stepIdx, s, PstepKPa, nowIso, nowIso, 0, "BUDGET_SKIP", stopReason, stopReason, false); %#ok<AGROW>
+            break;
+        end
+
+        fid = fopen(summaryPath, 'a', 'n', 'UTF-8');
+        fprintf(fid, "\nStepStart: stage=%s idx=%d global=%d s=%.6g P_load_kPa=%.6g budget_remaining_s=%.1f\n", stageName, stepIdx, globalStep, s, PstepKPa, budgetRemainingBefore);
+        fclose(fid);
+
+        % Set P_load for this step.
+        try
+            model.param.set('P_load', sprintf('%.6g[kPa]', PstepKPa));
+        catch
+            try, model.param.set('P_load', sprintf('%.6g*1e3[Pa]', PstepKPa)); catch, end
+        end
+
+        stepT0 = tic;
+        ok = false;
+        errMsg = 'none';
+        try
+            model.study('std1').run();
+            ok = true;
+        catch ME
+            ok = false;
+            errMsg = string(ME.message);
+        end
+        elapsedS = toc(stepT0);
+        endIso = datestr(now, 'yyyy-mm-ddTHH:MM:SS');
+
+        ATop = NaN;
+        Fz = NaN;
+        PEff = NaN;
+        tnMax = NaN;
+        Ac = 0;
+        pnAvg = NaN;
+        acWhy = 'none';
+        checkpointSaved = false;
+        if ok
+            try, ATop = mphint2(model, '1', 'surface', 'selection', bnd_rigid_top); catch, end
+            try, Fz = mphint2(model, 'solid.RFz', 'surface', 'selection', bnd_rigid_top); catch, end
+            if isfinite(ATop) && ATop > 0 && isfinite(Fz)
+                PEff = abs(Fz) ./ ATop;
+            end
+            try
+                [tnMax, Ac, pnAvg, acWhy] = eval_contact_metrics_with_why(model, bnd_eval, tnEpsPa);
+            catch
+            end
+            try
+                model.save(checkpointOut);
+                checkpointSaved = true;
+            catch
+                checkpointSaved = false;
+            end
+        end
+
+        exitStatusStep = tern(ok, "OK", "FAIL");
+        append_metrics_pressure_row(metricsPath, globalStep, s, PstepKPa, PEff, Fz, ATop, Ac, tnMax, pnAvg, acWhy, ok, exitStatusStep, errMsg, elapsedS, ...
+            linearSolverMode, linearSwitched, linearNote, solverCoupling, segDisabled, segNote, fcEnabled, fcMaxIterSet, fcNote, contactMode, contactEffective, contactSupported, contactNote, checkpointSaved, ...
+            runId, stageName, fcMode, fcMaxIterTarget, fcDampedRequested > 0.5, fcDampedEffective, fcLineSearchRequested > 0.5, fcLineSearchEffective, stabilizationRequested > 0.5, stabilizationEffective, budgetS, budgetRemainingBefore);
+
+        steps(end+1) = make_step(stageName, stepIdx, s, PstepKPa, nowIso, endIso, elapsedS, exitStatusStep, errMsg, excerpt(string_or_none(errMsg), 300), checkpointSaved); %#ok<AGROW>
+
+        fid = fopen(summaryPath, 'a', 'n', 'UTF-8');
+        fprintf(fid, "StepEnd: stage=%s idx=%d global=%d status=%s elapsed_s=%.6g checkpoint_saved=%d\n", stageName, stepIdx, globalStep, exitStatusStep, elapsedS, tern(checkpointSaved,1,0));
+        fclose(fid);
+
+        if ok
+            hadAnySuccess = true;
+            lastOkGlobal = globalStep;
+            lastOkStage = stageName;
+            lastOkS = s;
+            lastOkP = PstepKPa;
+            continue;
+        end
+
+        % Failure handling:
+        % - In two-stage mode, stage-1 failure proceeds to stage-2 ramp.
+        % - Otherwise (or ramp stage), fail-fast immediately after first failed step.
+        if igniteTwoStage > 0.5 && stageName == "single"
+            stage1Failed = true;
+            stage1FailReason = errMsg;
+            break;
+        end
+
+        failReason = errMsg;
+        failStage = stageName;
+        failStepIdx = stepIdx;
+        failS = s;
+        failP = PstepKPa;
+        stopReason = "STEP_FAILED";
+        break;
+    end
+
+    if stopReason == "BUDGET_EXCEEDED_BEFORE_STEP" || stopReason == "STEP_FAILED"
+        break;
+    end
+end
+
+if isempty(strtrim(stopReason)) || stopReason == "none"
+    if hadAnySuccess
+        stopReason = "COMPLETED";
+    else
+        stopReason = "FAILED";
+    end
+end
+
+if ~hadAnySuccess && stage1Failed && igniteTwoStage > 0.5
+    % Stage-1 failed and no ramp success => mark failure reason.
+    failReason = stage1FailReason;
+    failStage = "single";
+    failStepIdx = 1;
+    failS = 1.0;
+    failP = PloadKPa;
+    stopReason = "STAGE1_FAILED_NO_RAMP_SUCCESS";
 end
 
 fid = fopen(summaryPath, 'a', 'n', 'UTF-8');
@@ -256,7 +413,16 @@ fprintf(fid, "disp_top_xy_only_ok: %d\n", dispTopOk);
 fprintf(fid, "pressure_load_ok: %d\n", pressureOk);
 fprintf(fid, "solver_coupling: %s\n", sanitize_csv_text(string_or_none(solverCoupling)));
 fprintf(fid, "ignite_ramp_enabled: %d\n", tern(igniteRamp > 0.5, 1, 0));
-fprintf(fid, "last_success_step_idx: %d\n", lastOkStepIdx);
+fprintf(fid, "ignite_two_stage: %d\n", tern(igniteTwoStage > 0.5, 1, 0));
+fprintf(fid, "ignite_ramp_default_mode: %s\n", sanitize_csv_text(string_or_none(igniteRampDefaultMode)));
+fprintf(fid, "ignite_ramp_list_str: %s\n", sanitize_csv_text(string_or_none(igniteRampListStr)));
+fprintf(fid, "budget_s: %g\n", budgetS);
+fprintf(fid, "budget_used_s: %.6g\n", toc(runT0));
+fprintf(fid, "stop_reason: %s\n", sanitize_csv_text(string_or_none(stopReason)));
+fprintf(fid, "last_success_global_step: %d\n", lastOkGlobal);
+fprintf(fid, "last_success_stage: %s\n", sanitize_csv_text(string_or_none(lastOkStage)));
+fprintf(fid, "last_success_s: %s\n", num2str(lastOkS));
+fprintf(fid, "last_success_P_load_kPa: %s\n", num2str(lastOkP));
 fprintf(fid, "linear_solver_mode: %s\n", sanitize_csv_text(string_or_none(linearSolverMode)));
 fprintf(fid, "linear_solver_switched: %d\n", tern(linearSwitched,1,0));
 fprintf(fid, "linear_solver_note: %s\n", sanitize_csv_text(string_or_none(linearNote)));
@@ -265,51 +431,88 @@ fprintf(fid, "segregated_note: %s\n", sanitize_csv_text(string_or_none(segNote))
 fprintf(fid, "fully_coupled_enabled: %d\n", tern(fcEnabled,1,0));
 fprintf(fid, "fully_coupled_maxiter_set: %s\n", num2str(fcMaxIterSet));
 fprintf(fid, "fully_coupled_note: %s\n", sanitize_csv_text(string_or_none(fcNote)));
+fprintf(fid, "fc_mode: %s\n", sanitize_csv_text(string_or_none(fcMode)));
+fprintf(fid, "fc_maxiter_target: %g\n", fcMaxIterTarget);
+fprintf(fid, "fc_damped_requested: %d\n", tern(fcDampedRequested > 0.5, 1, 0));
+fprintf(fid, "fc_damped_effective: %d\n", tern(fcDampedEffective, 1, 0));
+fprintf(fid, "fc_damped_note: %s\n", sanitize_csv_text(string_or_none(fcDampedNote)));
+fprintf(fid, "fc_linesearch_requested: %d\n", tern(fcLineSearchRequested > 0.5, 1, 0));
+fprintf(fid, "fc_linesearch_effective: %d\n", tern(fcLineSearchEffective, 1, 0));
+fprintf(fid, "fc_linesearch_note: %s\n", sanitize_csv_text(string_or_none(fcLineSearchNote)));
+fprintf(fid, "stabilization_requested: %d\n", tern(stabilizationRequested > 0.5, 1, 0));
+fprintf(fid, "stabilization_effective: %d\n", tern(stabilizationEffective, 1, 0));
+fprintf(fid, "stabilization_note: %s\n", sanitize_csv_text(string_or_none(stabilizationNote)));
 fprintf(fid, "contact_mode_effective: %s\n", sanitize_csv_text(string_or_none(contactEffective)));
 fprintf(fid, "contact_mode_supported: %d\n", tern(contactSupported,1,0));
 fprintf(fid, "contact_mode_note: %s\n", sanitize_csv_text(string_or_none(contactNote)));
+exitStatus = tern(hadAnySuccess && (stopReason == "COMPLETED" || (igniteTwoStage > 0.5 && stage1Failed && stopReason == "COMPLETED")), "SUCCESS", "FAIL");
 fprintf(fid, "exit_status: %s\n", sanitize_csv_text(exitStatus));
 if exitStatus == "FAIL"
-    fprintf(fid, "fail_step_idx: %s\n", num2str(stepFailIdx));
-    fprintf(fid, "fail_step_s: %s\n", num2str(stepFailS));
-    fprintf(fid, "fail_step_P_load_kPa: %s\n", num2str(stepFailP));
-    fprintf(fid, "fail_reason: %s\n", sanitize_csv_text(string_or_none(stepFailReason)));
+    fprintf(fid, "fail_stage: %s\n", sanitize_csv_text(string_or_none(failStage)));
+    fprintf(fid, "fail_step_idx: %s\n", num2str(failStepIdx));
+    fprintf(fid, "fail_step_s: %s\n", num2str(failS));
+    fprintf(fid, "fail_step_P_load_kPa: %s\n", num2str(failP));
+    fprintf(fid, "fail_reason: %s\n", sanitize_csv_text(string_or_none(failReason)));
 else
     fprintf(fid, "fail_reason: none\n");
 end
 fprintf(fid, "checkpoint_last_ok_exists: %d\n", tern(exist(checkpointOut,'file')==2,1,0));
 fclose(fid);
 
-if exitStatus == "FAIL"
-    try
-        payload = struct();
-        payload.exit_status = 'FAIL';
-        payload.P_load_kPa = PloadKPa;
-        payload.ignite_ramp_enabled = tern(igniteRamp > 0.5, true, false);
-        payload.last_success_step_idx = lastOkStepIdx;
-        payload.fail_step_idx = stepFailIdx;
-        payload.fail_step_s = stepFailS;
-        payload.fail_step_P_load_kPa = stepFailP;
-        payload.fail_reason = string_or_none(stepFailReason);
-        payload.linear_solver_mode = string_or_none(linearSolverMode);
-        payload.linear_solver_switched = linearSwitched;
-        payload.linear_solver_note = string_or_none(linearNote);
-        payload.solver_coupling = string_or_none(solverCoupling);
-        payload.segregated_disabled = segDisabled;
-        payload.segregated_note = string_or_none(segNote);
-        payload.fully_coupled_enabled = fcEnabled;
-        payload.fully_coupled_maxiter_set = fcMaxIterSet;
-        payload.fully_coupled_note = string_or_none(fcNote);
-        payload.contact_mode_requested = string_or_none(contactMode);
-        payload.contact_mode_effective = string_or_none(contactEffective);
-        payload.contact_mode_supported = contactSupported;
-        payload.contact_mode_note = string_or_none(contactNote);
-        txt = jsonencode(payload);
-        fid = fopen(errorsPath, 'w', 'n', 'UTF-8');
-        fprintf(fid, '%s', txt);
-        fclose(fid);
-    catch
-    end
+% Always write errors.json (even on SUCCESS) for deterministic post-mortem.
+try
+    payload = struct();
+    payload.run_id = runId;
+    payload.exit_status = char(exitStatus);
+    payload.stop_reason = char(string_or_none(stopReason));
+    payload.P_load_kPa = PloadKPa;
+    payload.ignite_ramp_enabled = tern(igniteRamp > 0.5, true, false);
+    payload.ignite_ramp_list_str = char(string_or_none(igniteRampListStr));
+    payload.ignite_ramp_default_mode = char(string_or_none(igniteRampDefaultMode));
+    payload.ignite_two_stage = tern(igniteTwoStage > 0.5, true, false);
+    payload.fc_mode = char(string_or_none(fcMode));
+    payload.fc_maxiter_target = fcMaxIterTarget;
+    payload.fc_damped_requested = tern(fcDampedRequested > 0.5, true, false);
+    payload.fc_damped_effective = tern(fcDampedEffective, true, false);
+    payload.fc_linesearch_requested = tern(fcLineSearchRequested > 0.5, true, false);
+    payload.fc_linesearch_effective = tern(fcLineSearchEffective, true, false);
+    payload.stabilization_requested = tern(stabilizationRequested > 0.5, true, false);
+    payload.stabilization_effective = tern(stabilizationEffective, true, false);
+    payload.budget_s = budgetS;
+    payload.budget_used_s = toc(runT0);
+
+    payload.last_success_global_step = lastOkGlobal;
+    payload.last_success_stage = char(string_or_none(lastOkStage));
+    payload.last_success_s = lastOkS;
+    payload.last_success_P_load_kPa = lastOkP;
+
+    payload.fail_stage = char(string_or_none(failStage));
+    payload.fail_step_idx = failStepIdx;
+    payload.fail_step_s = failS;
+    payload.fail_step_P_load_kPa = failP;
+    payload.fail_reason = char(string_or_none(failReason));
+
+    payload.linear_solver_mode = char(string_or_none(linearSolverMode));
+    payload.linear_solver_switched = linearSwitched;
+    payload.linear_solver_note = char(string_or_none(linearNote));
+    payload.solver_coupling = char(string_or_none(solverCoupling));
+    payload.segregated_disabled = segDisabled;
+    payload.segregated_note = char(string_or_none(segNote));
+    payload.fully_coupled_enabled = fcEnabled;
+    payload.fully_coupled_maxiter_set = fcMaxIterSet;
+    payload.fully_coupled_note = char(string_or_none(fcNote));
+    payload.contact_mode_requested = char(string_or_none(contactMode));
+    payload.contact_mode_effective = char(string_or_none(contactEffective));
+    payload.contact_mode_supported = contactSupported;
+    payload.contact_mode_note = char(string_or_none(contactNote));
+
+    payload.steps = steps;
+
+    txt = jsonencode(payload);
+    fid = fopen(errorsPath, 'w', 'n', 'UTF-8');
+    fprintf(fid, '%s', txt);
+    fclose(fid);
+catch
 end
 
 try, ModelUtil.remove('model'); catch, end %#ok<TRYNC>
@@ -320,28 +523,38 @@ if exist(path, 'file')
     return;
 end
 fid = fopen(path, 'w', 'n', 'UTF-8');
-fprintf(fid, 'timestamp_iso,step_index,s,P_load_kPa,P_eff_Pa,Fz_top_int_N,A_top_m2,Ac_m2,Tn_max_Pa,pn_avg_Pa,Ac_method,success,exit_status,fail_reason,elapsed_s,linear_solver_mode,linear_solver_switched,linear_solver_note,solver_coupling,segregated_disabled,segregated_note,fully_coupled_enabled,fully_coupled_maxiter_set,fully_coupled_note,contact_mode_requested,contact_mode_effective,contact_mode_supported,contact_mode_note,checkpoint_saved\n');
+fprintf(fid, 'timestamp_iso,step_index,s,P_load_kPa,P_eff_Pa,Fz_top_int_N,A_top_m2,Ac_m2,Tn_max_Pa,pn_avg_Pa,Ac_method,success,exit_status,fail_reason,elapsed_s,linear_solver_mode,linear_solver_switched,linear_solver_note,solver_coupling,segregated_disabled,segregated_note,fully_coupled_enabled,fully_coupled_maxiter_set,fully_coupled_note,contact_mode_requested,contact_mode_effective,contact_mode_supported,contact_mode_note,checkpoint_saved,run_id,stage,fc_mode,fc_maxiter_target,fc_damped_requested,fc_damped_effective,fc_linesearch_requested,fc_linesearch_effective,stabilization_requested,stabilization_effective,budget_s,budget_remaining_s_before_step,fail_reason_short\n');
 fclose(fid);
 end
 
-function append_metrics_pressure_row(path, stepIdx, s, PkPa, PEff, Fz, ATop, Ac, tnMax, pnAvg, acWhy, ok, exitStatus, errMsg, elapsedS, linearSolverMode, switched, switchNote, solverCoupling, segDisabled, segNote, fcEnabled, fcMaxIterSet, fcNote, contactMode, contactEffective, contactSupported, contactNote, checkpointSaved)
+function append_metrics_pressure_row(path, stepIdx, s, PkPa, PEff, Fz, ATop, Ac, tnMax, pnAvg, acWhy, ok, exitStatus, errMsg, elapsedS, linearSolverMode, switched, switchNote, solverCoupling, segDisabled, segNote, fcEnabled, fcMaxIterSet, fcNote, contactMode, contactEffective, contactSupported, contactNote, checkpointSaved, runId, stageName, fcMode, fcMaxIterTarget, fcDampedRequested, fcDampedEffective, fcLineSearchRequested, fcLineSearchEffective, stabilizationRequested, stabilizationEffective, budgetS, budgetRemainingBefore)
 fid = fopen(path, 'a', 'n', 'UTF-8');
 ts = datestr(now, 'yyyy-mm-ddTHH:MM:SS');
-fprintf(fid, '%s,%d,%.6g,%.6g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%s,%d,%s,%s,%.6g,%s,%d,%s,%s,%d,%s,%d,%.6g,%s,%s,%s,%d,%s,%d\n', ...
+shortMsg = excerpt(string_or_none(errMsg), 140);
+fprintf(fid, '%s,%d,%.6g,%.6g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%s,%d,%s,%s,%.6g,%s,%d,%s,%s,%d,%s,%d,%.6g,%s,%s,%s,%d,%s,%d,%s,%s,%s,%.6g,%d,%d,%d,%d,%d,%d,%.6g,%.6g,%s\n', ...
     ts, stepIdx, s, PkPa, PEff, Fz, ATop, Ac, tnMax, pnAvg, sanitize_csv_text(string_or_none(acWhy)), tern(ok,1,0), sanitize_csv_text(string_or_none(exitStatus)), sanitize_csv_text(string_or_none(errMsg)), elapsedS, ...
     sanitize_csv_text(string_or_none(linearSolverMode)), tern(switched,1,0), sanitize_csv_text(string_or_none(switchNote)), ...
     sanitize_csv_text(string_or_none(solverCoupling)), tern(segDisabled,1,0), sanitize_csv_text(string_or_none(segNote)), ...
     tern(fcEnabled,1,0), fcMaxIterSet, sanitize_csv_text(string_or_none(fcNote)), ...
-    sanitize_csv_text(string_or_none(contactMode)), sanitize_csv_text(string_or_none(contactEffective)), tern(contactSupported,1,0), sanitize_csv_text(string_or_none(contactNote)), tern(checkpointSaved,1,0));
+    sanitize_csv_text(string_or_none(contactMode)), sanitize_csv_text(string_or_none(contactEffective)), tern(contactSupported,1,0), sanitize_csv_text(string_or_none(contactNote)), tern(checkpointSaved,1,0), ...
+    sanitize_csv_text(string_or_none(runId)), sanitize_csv_text(string_or_none(stageName)), sanitize_csv_text(string_or_none(fcMode)), fcMaxIterTarget, ...
+    tern(fcDampedRequested,1,0), tern(fcDampedEffective,1,0), tern(fcLineSearchRequested,1,0), tern(fcLineSearchEffective,1,0), tern(stabilizationRequested,1,0), tern(stabilizationEffective,1,0), ...
+    budgetS, budgetRemainingBefore, sanitize_csv_text(shortMsg));
 fclose(fid);
 end
 
-function [segDisabled, segNote, fcEnabled, fcNote, fcMaxIterSet] = configure_solver_coupling(model, solverCoupling, maxSegIter, maxSubIter, fcMaxIter)
+function [segDisabled, segNote, fcEnabled, fcNote, fcMaxIterSet, dampEff, dampNote, lsEff, lsNote, stabEff, stabNote] = configure_solver_coupling(model, solverCoupling, maxSegIter, maxSubIter, fcMaxIterTarget, fcMode, dampReq, lsReq, stabReq)
 segDisabled = false;
 segNote = 'none';
 fcEnabled = false;
 fcNote = 'none';
 fcMaxIterSet = NaN;
+dampEff = false;
+dampNote = 'none';
+lsEff = false;
+lsNote = 'none';
+stabEff = false;
+stabNote = 'none';
 mode = lower(strtrim(string(solverCoupling)));
 if mode == "" || mode == "default"
     mode = "segregated";
@@ -371,6 +584,9 @@ if mode == "fully_coupled" || mode == "fully"
             fcEnabled = false;
             fcNote = string(ME.message);
             fcMaxIterSet = NaN;
+            dampEff = false; dampNote = 'create_fc1_failed';
+            lsEff = false; lsNote = 'create_fc1_failed';
+            stabEff = false; stabNote = 'create_fc1_failed';
             return;
         end
     end
@@ -381,13 +597,67 @@ if mode == "fully_coupled" || mode == "fully"
 
     % Cap nonlinear iterations for deterministic failure.
     try
-        fc1.set('maxiter', fcMaxIter);
-        fcMaxIterSet = fcMaxIter;
+        fc1.set('maxiter', fcMaxIterTarget);
+        fcMaxIterSet = fcMaxIterTarget;
     catch
         fcMaxIterSet = NaN;
     end
     % Prefer direct solver definition.
     try, fc1.set('linsolver', 'dDef'); catch, end
+
+    % Robust/fast-fail mode knobs (best-effort).
+    fcModeStr = lower(strtrim(string(fcMode)));
+    if fcModeStr == "" || fcModeStr == "default"
+        fcModeStr = "fast_fail";
+    end
+    if fcModeStr == "robust"
+        % Slightly more conservative defaults (best-effort; ignore if unsupported).
+        try, fc1.set('adapttol', 'on'); catch, end
+        try, fc1.set('initiallintol', 1e-3); catch, end
+        try, fc1.set('etamax', 0.9); catch, end
+    end
+
+    % Damped Newton (best-effort).
+    if dampReq
+        [dampEff, dampNote] = try_set_any(fc1, {'dtech','nlin','dampexponent'}, {'damped','dampedNewton','on'});
+        if ~dampEff
+            [dampEff, dampNote] = try_set_any(fc1, {'damp','dampfactor'}, {0.7, 0.5});
+        end
+        if ~dampEff
+            dampNote = 'not_supported';
+        end
+    else
+        dampEff = false;
+        dampNote = 'not_requested';
+    end
+
+    % Line search / backtracking (best-effort).
+    if lsReq
+        [lsEff, lsNote] = try_set_any(fc1, {'backmethod'}, {'auto','linesearch','lineSearch','backtracking'});
+        if ~lsEff
+            [lsEff, lsNote] = try_set_any(fc1, {'backtrackonce'}, {'on', 1});
+        end
+        if ~lsEff
+            lsNote = 'not_supported';
+        end
+    else
+        lsEff = false;
+        lsNote = 'not_requested';
+    end
+
+    % Solver stabilization (best-effort; stationary).
+    if stabReq
+        [stabEff, stabNote] = try_set_any(fc1, {'ressmooth','relaxationressmooth'}, {'on', 1});
+        if ~stabEff
+            [stabEff, stabNote] = try_set_any(fc1, {'stabacc'}, {'on', 1});
+        end
+        if ~stabEff
+            stabNote = 'not_supported';
+        end
+    else
+        stabEff = false;
+        stabNote = 'not_requested';
+    end
 else
     % Segregated (legacy).
     try, se1.active(true); catch, end
@@ -408,6 +678,127 @@ else
     fcEnabled = false;
     fcNote = 'disabled';
     fcMaxIterSet = NaN;
+    dampEff = false; dampNote = 'n/a (segregated)';
+    lsEff = false; lsNote = 'n/a (segregated)';
+    stabEff = false; stabNote = 'n/a (segregated)';
+end
+end
+
+function [sList, note] = resolve_ramp_list(rampEnabled, listStr, defaultMode)
+sList = [];
+note = 'none';
+if ~rampEnabled
+    sList = [];
+    note = 'ramp_disabled';
+    return;
+end
+
+if ~isempty(strtrim(string(listStr)))
+    [vals, ok] = parse_num_list(listStr);
+    if ok && ~isempty(vals)
+        sList = vals(:).';
+        note = 'from_SIM_IGNITE_RAMP_LIST';
+        return;
+    end
+    note = 'invalid_SIM_IGNITE_RAMP_LIST_fallback';
+end
+
+mode = lower(strtrim(string(defaultMode)));
+if mode == "" || mode == "default"
+    mode = "legacy";
+end
+if mode == "high_to_low"
+    sList = [1.0, 0.75, 0.5, 0.25];
+    note = 'default_high_to_low';
+else
+    % legacy (backwards compatible)
+    sList = [0.25, 0.5, 0.75, 1.0];
+    note = 'default_legacy';
+end
+end
+
+function [vals, ok] = parse_num_list(s)
+ok = false;
+vals = [];
+try
+    parts = split(string(s), {',',';',' ','\t'});
+    parts = parts(parts ~= "");
+    vv = nan(size(parts));
+    for i = 1:numel(parts)
+        vv(i) = str2double(parts(i));
+    end
+    vv = vv(isfinite(vv));
+    if isempty(vv)
+        ok = false;
+        vals = [];
+        return;
+    end
+    ok = true;
+    vals = vv;
+catch
+    ok = false;
+    vals = [];
+end
+end
+
+function s = s_list_to_string(v)
+if isempty(v)
+    s = "[]";
+    return;
+end
+try
+    s = mat2str(v, 6);
+catch
+    s = "[]";
+end
+end
+
+function st = make_step(stage, stepIdx, s, PkPa, startIso, endIso, elapsedS, exitStatus, reason, excerptMsg, checkpointSaved)
+st = struct();
+st.stage = char(string(stage));
+st.step_index = stepIdx;
+st.s = s;
+st.P_load_kPa = PkPa;
+st.start_time_iso = char(string_or_none(startIso));
+st.end_time_iso = char(string_or_none(endIso));
+st.elapsed_s = elapsedS;
+st.exit_status = char(string_or_none(exitStatus));
+st.reason = char(string_or_none(reason));
+st.comsol_message_excerpt = char(string_or_none(excerptMsg));
+st.checkpoint_saved = tern(checkpointSaved, true, false);
+end
+
+function [ok, note] = try_set_any(feat, propNames, candidates)
+ok = false;
+note = 'none';
+if ischar(propNames) || isstring(propNames)
+    propNames = {char(propNames)};
+end
+if ~iscell(candidates)
+    candidates = {candidates};
+end
+for iP = 1:numel(propNames)
+    prop = propNames{iP};
+    for iC = 1:numel(candidates)
+        val = candidates{iC};
+        try
+            feat.set(prop, val);
+            ok = true;
+            note = sprintf('%s set', prop);
+            return;
+        catch
+        end
+    end
+end
+end
+
+function s = excerpt(s, maxLen)
+s = string_or_none(s);
+if nargin < 2 || ~isfinite(maxLen) || maxLen <= 0
+    return;
+end
+if strlength(s) > maxLen
+    s = extractBefore(s, maxLen+1);
 end
 end
 

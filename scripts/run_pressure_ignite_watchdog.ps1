@@ -21,6 +21,37 @@ param(
   [int]$IgniteRamp = 0,
 
   [Parameter(Mandatory = $false)]
+  [ValidateSet(0,1)]
+  [int]$IgniteTwoStage = 0,
+
+  # Comma-separated list of ramp s values, e.g. "1.0,0.75,0.5,0.25"
+  [Parameter(Mandatory = $false)]
+  [string]$IgniteRampList = "",
+
+  [Parameter(Mandatory = $false)]
+  [ValidateSet("legacy","high_to_low")]
+  [string]$IgniteRampDefaultMode = "legacy",
+
+  [Parameter(Mandatory = $false)]
+  [ValidateSet("fast_fail","robust")]
+  [string]$FcMode = "fast_fail",
+
+  [Parameter(Mandatory = $false)]
+  [ValidateSet(0,1)]
+  [int]$FcDamped = 0,
+
+  [Parameter(Mandatory = $false)]
+  [ValidateSet(0,1)]
+  [int]$FcLineSearch = 0,
+
+  [Parameter(Mandatory = $false)]
+  [ValidateSet(0,1)]
+  [int]$SolverStabilization = 0,
+
+  [Parameter(Mandatory = $false)]
+  [int]$IgniteBudgetSec = 1500,
+
+  [Parameter(Mandatory = $false)]
   [int]$TimeoutSec = 900,
 
   [Parameter(Mandatory = $false)]
@@ -78,6 +109,14 @@ Write-Host ("ContactMode       : {0}" -f $ContactMode)
 Write-Host ("LinearSolverMode  : {0}" -f $LinearSolverMode)
 Write-Host ("SolverCoupling    : {0}" -f $SolverCoupling)
 Write-Host ("IgniteRamp        : {0}" -f $IgniteRamp)
+Write-Host ("IgniteTwoStage    : {0}" -f $IgniteTwoStage)
+Write-Host ("IgniteRampList    : {0}" -f $IgniteRampList)
+Write-Host ("IgniteRampDefault : {0}" -f $IgniteRampDefaultMode)
+Write-Host ("FcMode            : {0}" -f $FcMode)
+Write-Host ("FcDamped          : {0}" -f $FcDamped)
+Write-Host ("FcLineSearch      : {0}" -f $FcLineSearch)
+Write-Host ("Stabilization     : {0}" -f $SolverStabilization)
+Write-Host ("IgniteBudgetSec   : {0}" -f $IgniteBudgetSec)
 Write-Host ("TimeoutSec        : {0}" -f $TimeoutSec)
 Write-Host ("HeartbeatSec      : {0}" -f $HeartbeatSec)
 
@@ -98,6 +137,14 @@ $env:SIM_LINEAR_SOLVER_MODE = $LinearSolverMode
 $env:SIM_TN_EPS_PA = "1"
 $env:SIM_SOLVER_COUPLING = $SolverCoupling
 $env:SIM_IGNITE_RAMP = ([string]$IgniteRamp)
+$env:SIM_IGNITE_TWO_STAGE = ([string]$IgniteTwoStage)
+$env:SIM_IGNITE_RAMP_LIST = $IgniteRampList
+$env:SIM_IGNITE_RAMP_DEFAULT_MODE = $IgniteRampDefaultMode
+$env:SIM_FC_MODE = $FcMode
+$env:SIM_FC_DAMPED = ([string]$FcDamped)
+$env:SIM_FC_LINESEARCH = ([string]$FcLineSearch)
+$env:SIM_SOLVER_STABILIZATION = ([string]$SolverStabilization)
+$env:SIM_IGNITE_BUDGET_S = ([string]$IgniteBudgetSec)
 
 $p = Start-Process -FilePath "matlab" -ArgumentList @("-batch","run_pyramid_array_5x5_pressure_ignite") -PassThru -NoNewWindow
 Write-Host ("MATLAB PID: {0}" -f $p.Id)
