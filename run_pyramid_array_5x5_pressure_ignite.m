@@ -506,13 +506,26 @@ try
     payload.contact_mode_supported = contactSupported;
     payload.contact_mode_note = char(string_or_none(contactNote));
 
-    payload.steps = steps;
+    payload.steps = steps_to_cell(steps);
 
     txt = jsonencode(payload);
     fid = fopen(errorsPath, 'w', 'n', 'UTF-8');
     fprintf(fid, '%s', txt);
     fclose(fid);
 catch
+end
+
+function c = steps_to_cell(steps)
+% Ensure JSON encodes steps as an array even when there is a single step.
+if isempty(steps)
+    c = {};
+    return;
+end
+try
+    c = num2cell(steps);
+catch
+    c = {steps};
+end
 end
 
 try, ModelUtil.remove('model'); catch, end %#ok<TRYNC>
