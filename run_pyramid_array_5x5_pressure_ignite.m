@@ -7,6 +7,7 @@ function run_pyramid_array_5x5_pressure_ignite()
 % - Applying pressure load P_load (downwards) on the rigid plate top boundary
 % - Switching to fully-coupled (disable segregated) + Direct(PARDISO) linear solver
 % - Producing a single-row metrics file for RP: Ac(P), etc.
+% - Ignite-v2: optional pressure ramp s=0.25->1.0 and fully-coupled path
 %
 % Outputs:
 %   out/pyramid_5x5/pressure_ignite_YYYYMMDD_HHMMSS/metrics_pressure.csv
@@ -46,10 +47,13 @@ PloadKPa = numeric_env('SIM_P_LOAD_KPA', 0.6);
 tnEpsPa = numeric_env('SIM_TN_EPS_PA', 1.0);
 contactMode = get_env_or_default('PHASE2_CONTACT_MODE', 'augmented_lagrange');
 linearSolverMode = get_env_or_default('SIM_LINEAR_SOLVER_MODE', 'direct_pardiso');
-solverCoupling = get_env_or_default('SIM_SOLVER_COUPLING', 'fully_coupled');
+solverCoupling = get_env_or_default('SIM_SOLVER_COUPLING', 'segregated');
+igniteRamp = numeric_env('SIM_IGNITE_RAMP', 0);
+
 disableSegregated = strcmpi(strtrim(solverCoupling), 'fully_coupled') || strcmpi(strtrim(solverCoupling), 'fully');
 maxSegIter = numeric_env('SIM_MAXSEGITER', 6);
 maxSubIter = numeric_env('SIM_MAXSUBITER', 4);
+fcMaxIter = numeric_env('SIM_FC_MAXITER', 12);
 
 fid = fopen(summaryPath, 'w', 'n', 'UTF-8');
 fprintf(fid, "summary_stage: START\n");
@@ -59,14 +63,15 @@ fprintf(fid, "P_load_kPa: %.6g\n", PloadKPa);
 fprintf(fid, "contact_mode_requested: %s\n", string(contactMode));
 fprintf(fid, "linear_solver_mode_requested: %s\n", string(linearSolverMode));
 fprintf(fid, "solver_coupling: %s\n", string(solverCoupling));
+fprintf(fid, "ignite_ramp_enabled: %d\n", tern(igniteRamp > 0.5, 1, 0));
 fprintf(fid, "disable_segregated: %d\n", disableSegregated);
 fprintf(fid, "segregated_maxsegiter: %g\n", maxSegIter);
 fprintf(fid, "segregated_maxsubiter: %g\n", maxSubIter);
+fprintf(fid, "fully_coupled_maxiter: %g\n", fcMaxIter);
 fclose(fid);
 
 write_metrics_pressure_header(metricsPath);
 
-t0 = tic;
 model = mphload(ckIn);
 model.hist.disable();
 
@@ -115,11 +120,6 @@ end
 % Apply pressure load in -z via P_load parameter.
 pressureOk = false;
 try
-    model.param.set('P_load', sprintf('%.6g[kPa]', PloadKPa));
-catch
-    try, model.param.set('P_load', sprintf('%.6g*1e3[Pa]', PloadKPa)); catch, end
-end
-try
     bndl = solid.feature('bndl1');
     bndl.set('forceType', 'FollowerPressure');
     bndl.set('pressure', '-P_load');
@@ -128,7 +128,7 @@ try
 catch
 end
 
-% Solver: attempt to disable segregated and force Direct(PARDISO).
+% Solver: force Direct(PARDISO) where possible, then configure coupling.
 linearSwitched = false;
 linearNote = 'none';
 try
@@ -140,35 +140,17 @@ end
 
 segDisabled = false;
 segNote = 'none';
+fcEnabled = false;
+fcNote = 'none';
+fcMaxIterSet = NaN;
 try
-    s1 = model.sol('sol1').feature('s1');
-    se1 = s1.feature('se1');
-    if disableSegregated
-        try
-            se1.active(false);
-            segDisabled = true;
-            segNote = 'sol1/s1/se1 deactivated (fully_coupled requested)';
-        catch ME
-            segDisabled = false;
-            segNote = string(ME.message);
-        end
-    else
-        % Fail-fast but returning: cap segregated outer iterations and inner nonlinear iterations.
-        try, se1.active(true); catch, end
-        try, se1.set('maxsegiter', maxSegIter); catch, end
-        try
-            ss1 = se1.feature('ss1');
-            try, ss1.set('maxsubiter', maxSubIter); catch, end
-            % Prefer Direct solver for segregated step if possible.
-            try, ss1.set('linsolver', 'dDef'); catch, end
-        catch
-        end
-        segDisabled = false;
-        segNote = sprintf('sol1/s1/se1 active; maxsegiter=%g, maxsubiter=%g', maxSegIter, maxSubIter);
-    end
+    [segDisabled, segNote, fcEnabled, fcNote, fcMaxIterSet] = configure_solver_coupling(model, solverCoupling, maxSegIter, maxSubIter, fcMaxIter);
 catch ME
     segDisabled = false;
     segNote = string(ME.message);
+    fcEnabled = false;
+    fcNote = string(ME.message);
+    fcMaxIterSet = NaN;
 end
 
 % Ensure we actually use initial values from the loaded checkpoint.
@@ -177,37 +159,94 @@ try, st.set('initmethod', 'sol'); catch, end
 try, st.set('initsol', 'current'); catch, end
 try, st.set('useinitsol', 'on'); catch, end
 
-ok = false;
-errMsg = 'none';
-try
-    model.study('std1').run();
-    ok = true;
-catch ME
-    ok = false;
-    errMsg = string(ME.message);
+% Ignite steps: either one shot (s=1.0) or a ramp s=[0.25 0.5 0.75 1.0]
+if igniteRamp > 0.5
+    sList = [0.25, 0.5, 0.75, 1.0];
+else
+    sList = 1.0;
 end
-elapsedS = toc(t0);
 
-ATop = NaN;
-Fz = NaN;
-PEff = NaN;
-tnMax = NaN;
-Ac = 0;
-pnAvg = NaN;
-acWhy = 'none';
-if ok
-    try, ATop = mphint2(model, '1', 'surface', 'selection', bnd_rigid_top); catch, end
-    try, Fz = mphint2(model, 'solid.RFz', 'surface', 'selection', bnd_rigid_top); catch, end
-    if isfinite(ATop) && ATop > 0 && isfinite(Fz)
-        PEff = abs(Fz) ./ ATop;
-    end
+exitStatus = "FAIL";
+lastOkStepIdx = 0;
+stepFailReason = "none";
+stepFailIdx = NaN;
+stepFailS = NaN;
+stepFailP = NaN;
+
+for stepIdx = 1:numel(sList)
+    s = sList(stepIdx);
+    PstepKPa = PloadKPa * s;
+    stepT0 = tic;
+
+    fid = fopen(summaryPath, 'a', 'n', 'UTF-8');
+    fprintf(fid, "\nStepStart: idx=%d s=%.6g P_load_kPa=%.6g\n", stepIdx, s, PstepKPa);
+    fclose(fid);
+
+    % Set P_load for this step.
     try
-        [tnMax, Ac, pnAvg, acWhy] = eval_contact_metrics_with_why(model, bnd_eval, tnEpsPa);
+        model.param.set('P_load', sprintf('%.6g[kPa]', PstepKPa));
     catch
+        try, model.param.set('P_load', sprintf('%.6g*1e3[Pa]', PstepKPa)); catch, end
     end
-end
 
-append_metrics_pressure_row(metricsPath, PloadKPa, PEff, Fz, ATop, Ac, tnMax, pnAvg, acWhy, ok, errMsg, elapsedS, linearSolverMode, linearSwitched, linearNote, contactMode, contactEffective, contactSupported, contactNote);
+    ok = false;
+    errMsg = 'none';
+    try
+        model.study('std1').run();
+        ok = true;
+    catch ME
+        ok = false;
+        errMsg = string(ME.message);
+    end
+    elapsedS = toc(stepT0);
+
+    ATop = NaN;
+    Fz = NaN;
+    PEff = NaN;
+    tnMax = NaN;
+    Ac = 0;
+    pnAvg = NaN;
+    acWhy = 'none';
+    checkpointSaved = false;
+    if ok
+        try, ATop = mphint2(model, '1', 'surface', 'selection', bnd_rigid_top); catch, end
+        try, Fz = mphint2(model, 'solid.RFz', 'surface', 'selection', bnd_rigid_top); catch, end
+        if isfinite(ATop) && ATop > 0 && isfinite(Fz)
+            PEff = abs(Fz) ./ ATop;
+        end
+        try
+            [tnMax, Ac, pnAvg, acWhy] = eval_contact_metrics_with_why(model, bnd_eval, tnEpsPa);
+        catch
+        end
+        try
+            model.save(checkpointOut);
+            checkpointSaved = true;
+        catch
+            checkpointSaved = false;
+        end
+    end
+
+    append_metrics_pressure_row(metricsPath, stepIdx, s, PstepKPa, PEff, Fz, ATop, Ac, tnMax, pnAvg, acWhy, ok, tern(ok,'SUCCESS','FAIL'), errMsg, elapsedS, ...
+        linearSolverMode, linearSwitched, linearNote, solverCoupling, segDisabled, segNote, fcEnabled, fcMaxIterSet, fcNote, contactMode, contactEffective, contactSupported, contactNote, checkpointSaved);
+
+    fid = fopen(summaryPath, 'a', 'n', 'UTF-8');
+    fprintf(fid, "StepEnd: idx=%d status=%s elapsed_s=%.6g checkpoint_saved=%d\n", stepIdx, tern(ok,'SUCCESS','FAIL'), elapsedS, tern(checkpointSaved,1,0));
+    fclose(fid);
+
+    if ok
+        lastOkStepIdx = stepIdx;
+        exitStatus = "SUCCESS";
+        continue;
+    end
+
+    % First failed step => stop immediately (deterministic termination) after writing artifacts.
+    stepFailReason = errMsg;
+    stepFailIdx = stepIdx;
+    stepFailS = s;
+    stepFailP = PstepKPa;
+    exitStatus = "FAIL";
+    break;
+end
 
 fid = fopen(summaryPath, 'a', 'n', 'UTF-8');
 fprintf(fid, "\nsummary_stage: END\n");
@@ -215,40 +254,52 @@ fprintf(fid, "dcnt1_only_ok: %d\n", dcntOnlyOk);
 fprintf(fid, "dcnt1_only_note: %s\n", sanitize_csv_text(string_or_none(dcntOnlyNote)));
 fprintf(fid, "disp_top_xy_only_ok: %d\n", dispTopOk);
 fprintf(fid, "pressure_load_ok: %d\n", pressureOk);
-fprintf(fid, "segregated_disabled: %d\n", segDisabled);
-fprintf(fid, "segregated_note: %s\n", sanitize_csv_text(string_or_none(segNote)));
 fprintf(fid, "solver_coupling: %s\n", sanitize_csv_text(string_or_none(solverCoupling)));
+fprintf(fid, "ignite_ramp_enabled: %d\n", tern(igniteRamp > 0.5, 1, 0));
+fprintf(fid, "last_success_step_idx: %d\n", lastOkStepIdx);
 fprintf(fid, "linear_solver_mode: %s\n", sanitize_csv_text(string_or_none(linearSolverMode)));
 fprintf(fid, "linear_solver_switched: %d\n", tern(linearSwitched,1,0));
 fprintf(fid, "linear_solver_note: %s\n", sanitize_csv_text(string_or_none(linearNote)));
+fprintf(fid, "segregated_disabled: %d\n", tern(segDisabled,1,0));
+fprintf(fid, "segregated_note: %s\n", sanitize_csv_text(string_or_none(segNote)));
+fprintf(fid, "fully_coupled_enabled: %d\n", tern(fcEnabled,1,0));
+fprintf(fid, "fully_coupled_maxiter_set: %s\n", num2str(fcMaxIterSet));
+fprintf(fid, "fully_coupled_note: %s\n", sanitize_csv_text(string_or_none(fcNote)));
 fprintf(fid, "contact_mode_effective: %s\n", sanitize_csv_text(string_or_none(contactEffective)));
 fprintf(fid, "contact_mode_supported: %d\n", tern(contactSupported,1,0));
 fprintf(fid, "contact_mode_note: %s\n", sanitize_csv_text(string_or_none(contactNote)));
-fprintf(fid, "exit_status: %s\n", tern(ok,"SUCCESS","FAIL"));
-fprintf(fid, "elapsed_s: %.6g\n", elapsedS);
-fprintf(fid, "P_eff_Pa: %.9g\n", PEff);
-fprintf(fid, "Fz_top_int_N: %.9g\n", Fz);
-fprintf(fid, "Ac_m2: %.9g\n", Ac);
-fprintf(fid, "Tn_max_Pa: %.9g\n", tnMax);
-fprintf(fid, "pn_avg_Pa: %.9g\n", pnAvg);
-fprintf(fid, "Ac_method: %s\n", sanitize_csv_text(string_or_none(acWhy)));
-fprintf(fid, "fail_reason: %s\n", sanitize_csv_text(string_or_none(tern(ok,"none",errMsg))));
+fprintf(fid, "exit_status: %s\n", sanitize_csv_text(exitStatus));
+if exitStatus == "FAIL"
+    fprintf(fid, "fail_step_idx: %s\n", num2str(stepFailIdx));
+    fprintf(fid, "fail_step_s: %s\n", num2str(stepFailS));
+    fprintf(fid, "fail_step_P_load_kPa: %s\n", num2str(stepFailP));
+    fprintf(fid, "fail_reason: %s\n", sanitize_csv_text(string_or_none(stepFailReason)));
+else
+    fprintf(fid, "fail_reason: none\n");
+end
+fprintf(fid, "checkpoint_last_ok_exists: %d\n", tern(exist(checkpointOut,'file')==2,1,0));
 fclose(fid);
 
-if ok
-    try, model.save(checkpointOut); catch, end
-else
+if exitStatus == "FAIL"
     try
         payload = struct();
         payload.exit_status = 'FAIL';
         payload.P_load_kPa = PloadKPa;
-        payload.elapsed_s = elapsedS;
-        payload.fail_reason = string_or_none(errMsg);
+        payload.ignite_ramp_enabled = tern(igniteRamp > 0.5, true, false);
+        payload.last_success_step_idx = lastOkStepIdx;
+        payload.fail_step_idx = stepFailIdx;
+        payload.fail_step_s = stepFailS;
+        payload.fail_step_P_load_kPa = stepFailP;
+        payload.fail_reason = string_or_none(stepFailReason);
         payload.linear_solver_mode = string_or_none(linearSolverMode);
         payload.linear_solver_switched = linearSwitched;
         payload.linear_solver_note = string_or_none(linearNote);
+        payload.solver_coupling = string_or_none(solverCoupling);
         payload.segregated_disabled = segDisabled;
         payload.segregated_note = string_or_none(segNote);
+        payload.fully_coupled_enabled = fcEnabled;
+        payload.fully_coupled_maxiter_set = fcMaxIterSet;
+        payload.fully_coupled_note = string_or_none(fcNote);
         payload.contact_mode_requested = string_or_none(contactMode);
         payload.contact_mode_effective = string_or_none(contactEffective);
         payload.contact_mode_supported = contactSupported;
@@ -269,18 +320,95 @@ if exist(path, 'file')
     return;
 end
 fid = fopen(path, 'w', 'n', 'UTF-8');
-fprintf(fid, 'timestamp_iso,P_load_kPa,P_eff_Pa,Fz_top_int_N,A_top_m2,Ac_m2,Tn_max_Pa,pn_avg_Pa,Ac_method,success,fail_reason,elapsed_s,linear_solver_mode,linear_solver_switched,linear_solver_note,contact_mode_requested,contact_mode_effective,contact_mode_supported,contact_mode_note\n');
+fprintf(fid, 'timestamp_iso,step_index,s,P_load_kPa,P_eff_Pa,Fz_top_int_N,A_top_m2,Ac_m2,Tn_max_Pa,pn_avg_Pa,Ac_method,success,exit_status,fail_reason,elapsed_s,linear_solver_mode,linear_solver_switched,linear_solver_note,solver_coupling,segregated_disabled,segregated_note,fully_coupled_enabled,fully_coupled_maxiter_set,fully_coupled_note,contact_mode_requested,contact_mode_effective,contact_mode_supported,contact_mode_note,checkpoint_saved\n');
 fclose(fid);
 end
 
-function append_metrics_pressure_row(path, PkPa, PEff, Fz, ATop, Ac, tnMax, pnAvg, acWhy, ok, errMsg, elapsedS, linearSolverMode, switched, switchNote, contactMode, contactEffective, contactSupported, contactNote)
+function append_metrics_pressure_row(path, stepIdx, s, PkPa, PEff, Fz, ATop, Ac, tnMax, pnAvg, acWhy, ok, exitStatus, errMsg, elapsedS, linearSolverMode, switched, switchNote, solverCoupling, segDisabled, segNote, fcEnabled, fcMaxIterSet, fcNote, contactMode, contactEffective, contactSupported, contactNote, checkpointSaved)
 fid = fopen(path, 'a', 'n', 'UTF-8');
 ts = datestr(now, 'yyyy-mm-ddTHH:MM:SS');
-fprintf(fid, '%s,%.6g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%s,%d,%s,%.6g,%s,%d,%s,%s,%s,%d,%s\n', ...
-    ts, PkPa, PEff, Fz, ATop, Ac, tnMax, pnAvg, sanitize_csv_text(string_or_none(acWhy)), tern(ok,1,0), sanitize_csv_text(string_or_none(errMsg)), elapsedS, ...
+fprintf(fid, '%s,%d,%.6g,%.6g,%.9g,%.9g,%.9g,%.9g,%.9g,%.9g,%s,%d,%s,%s,%.6g,%s,%d,%s,%s,%d,%s,%d,%s,%s,%s,%s,%d,%s,%d\n', ...
+    ts, stepIdx, s, PkPa, PEff, Fz, ATop, Ac, tnMax, pnAvg, sanitize_csv_text(string_or_none(acWhy)), tern(ok,1,0), sanitize_csv_text(string_or_none(exitStatus)), sanitize_csv_text(string_or_none(errMsg)), elapsedS, ...
     sanitize_csv_text(string_or_none(linearSolverMode)), tern(switched,1,0), sanitize_csv_text(string_or_none(switchNote)), ...
-    sanitize_csv_text(string_or_none(contactMode)), sanitize_csv_text(string_or_none(contactEffective)), tern(contactSupported,1,0), sanitize_csv_text(string_or_none(contactNote)));
+    sanitize_csv_text(string_or_none(solverCoupling)), tern(segDisabled,1,0), sanitize_csv_text(string_or_none(segNote)), ...
+    tern(fcEnabled,1,0), fcMaxIterSet, sanitize_csv_text(string_or_none(fcNote)), ...
+    sanitize_csv_text(string_or_none(contactMode)), sanitize_csv_text(string_or_none(contactEffective)), tern(contactSupported,1,0), sanitize_csv_text(string_or_none(contactNote)), tern(checkpointSaved,1,0));
 fclose(fid);
+end
+
+function [segDisabled, segNote, fcEnabled, fcNote, fcMaxIterSet] = configure_solver_coupling(model, solverCoupling, maxSegIter, maxSubIter, fcMaxIter)
+segDisabled = false;
+segNote = 'none';
+fcEnabled = false;
+fcNote = 'none';
+fcMaxIterSet = NaN;
+mode = lower(strtrim(string(solverCoupling)));
+if mode == "" || mode == "default"
+    mode = "segregated";
+end
+
+s1 = model.sol('sol1').feature('s1');
+se1 = s1.feature('se1');
+
+if mode == "fully_coupled" || mode == "fully"
+    % Disable segregated.
+    try, se1.active(false); catch, end
+    segDisabled = true;
+    segNote = 'sol1/s1/se1 deactivated';
+
+    % Ensure FullyCoupled feature exists and is active.
+    try
+        s1.feature('fc1');
+        hasFc = true;
+    catch
+        hasFc = false;
+    end
+    if ~hasFc
+        try
+            s1.feature.create('fc1', 'FullyCoupled');
+            hasFc = true;
+        catch ME
+            fcEnabled = false;
+            fcNote = string(ME.message);
+            fcMaxIterSet = NaN;
+            return;
+        end
+    end
+    fc1 = s1.feature('fc1');
+    try, fc1.active(true); catch, end
+    fcEnabled = true;
+    fcNote = 'sol1/s1/fc1 enabled';
+
+    % Cap nonlinear iterations for deterministic failure.
+    try
+        fc1.set('maxiter', fcMaxIter);
+        fcMaxIterSet = fcMaxIter;
+    catch
+        fcMaxIterSet = NaN;
+    end
+    % Prefer direct solver definition.
+    try, fc1.set('linsolver', 'dDef'); catch, end
+else
+    % Segregated (legacy).
+    try, se1.active(true); catch, end
+    try, se1.set('maxsegiter', maxSegIter); catch, end
+    try
+        ss1 = se1.feature('ss1');
+        try, ss1.set('maxsubiter', maxSubIter); catch, end
+        try, ss1.set('linsolver', 'dDef'); catch, end
+    catch
+    end
+    segDisabled = false;
+    segNote = sprintf('sol1/s1/se1 active; maxsegiter=%g, maxsubiter=%g', maxSegIter, maxSubIter);
+    % Ensure fc1 (if present) is not the active path.
+    try
+        s1.feature('fc1').active(false);
+    catch
+    end
+    fcEnabled = false;
+    fcNote = 'disabled';
+    fcMaxIterSet = NaN;
+end
 end
 
 function [tnMax, Ac, pnAvg, why] = eval_contact_metrics_with_why(model, bnd_eval, tnEpsPa)

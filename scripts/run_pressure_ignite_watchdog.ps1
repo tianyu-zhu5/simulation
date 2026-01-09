@@ -17,6 +17,10 @@ param(
   [string]$SolverCoupling = "segregated",
 
   [Parameter(Mandatory = $false)]
+  [ValidateSet(0,1)]
+  [int]$IgniteRamp = 0,
+
+  [Parameter(Mandatory = $false)]
   [int]$TimeoutSec = 900,
 
   [Parameter(Mandatory = $false)]
@@ -72,6 +76,8 @@ Write-Host ("FromSimDir        : {0}" -f $FromSimDir)
 Write-Host ("PloadKPa          : {0}" -f $PloadKPa)
 Write-Host ("ContactMode       : {0}" -f $ContactMode)
 Write-Host ("LinearSolverMode  : {0}" -f $LinearSolverMode)
+Write-Host ("SolverCoupling    : {0}" -f $SolverCoupling)
+Write-Host ("IgniteRamp        : {0}" -f $IgniteRamp)
 Write-Host ("TimeoutSec        : {0}" -f $TimeoutSec)
 Write-Host ("HeartbeatSec      : {0}" -f $HeartbeatSec)
 
@@ -91,6 +97,7 @@ $env:PHASE2_CONTACT_MODE = $ContactMode
 $env:SIM_LINEAR_SOLVER_MODE = $LinearSolverMode
 $env:SIM_TN_EPS_PA = "1"
 $env:SIM_SOLVER_COUPLING = $SolverCoupling
+$env:SIM_IGNITE_RAMP = ([string]$IgniteRamp)
 
 $p = Start-Process -FilePath "matlab" -ArgumentList @("-batch","run_pyramid_array_5x5_pressure_ignite") -PassThru -NoNewWindow
 Write-Host ("MATLAB PID: {0}" -f $p.Id)
