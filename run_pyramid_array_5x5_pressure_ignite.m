@@ -51,6 +51,7 @@ linearSolverMode = get_env_or_default('SIM_LINEAR_SOLVER_MODE', 'direct_pardiso'
 solverCoupling = get_env_or_default('SIM_SOLVER_COUPLING', 'segregated');
 igniteRamp = numeric_env('SIM_IGNITE_RAMP', 0);
 plateRbmFixRequested = numeric_env('SIM_PLATE_RBM_FIX', 1) > 0.5;
+igniteAudit = numeric_env('SIM_IGNITE_AUDIT', 0) > 0.5;
 
 igniteRampListStr = get_env_or_default('SIM_IGNITE_RAMP_LIST', '');
 igniteRampDefaultMode = get_env_or_default('SIM_IGNITE_RAMP_DEFAULT_MODE', 'legacy');
@@ -77,6 +78,20 @@ if isfinite(fcMaxIterOverride)
     fcMaxIterTarget = fcMaxIterOverride;
 end
 
+% IGNITE_AUDIT mode: force a single-step attempt (no ramp, no two-stage) and a smaller internal budget.
+auditBudgetS = numeric_env('SIM_IGNITE_AUDIT_BUDGET_S', 300);
+auditFcMaxIter = numeric_env('SIM_IGNITE_AUDIT_FC_MAXITER', 12);
+if igniteAudit
+    igniteRamp = 0;
+    igniteTwoStage = 0;
+    igniteRampListStr = '';
+    igniteRampDefaultMode = 'legacy';
+    igniteBudgetS = auditBudgetS;
+    if isfinite(auditFcMaxIter) && auditFcMaxIter > 0
+        fcMaxIterTarget = min(fcMaxIterTarget, auditFcMaxIter);
+    end
+end
+
 runId = datestr(now, 'yyyymmdd_HHMMSS');
 
 fid = fopen(summaryPath, 'w', 'n', 'UTF-8');
@@ -88,6 +103,7 @@ fprintf(fid, "contact_mode_requested: %s\n", string(contactMode));
 fprintf(fid, "linear_solver_mode_requested: %s\n", string(linearSolverMode));
 fprintf(fid, "solver_coupling: %s\n", string(solverCoupling));
 fprintf(fid, "plate_rbm_fix_requested: %d\n", tern(plateRbmFixRequested, 1, 0));
+fprintf(fid, "ignite_audit_mode: %d\n", tern(igniteAudit, 1, 0));
 fprintf(fid, "ignite_ramp_enabled: %d\n", tern(igniteRamp > 0.5, 1, 0));
 fprintf(fid, "ignite_ramp_list_str: %s\n", string_or_none(igniteRampListStr));
 fprintf(fid, "ignite_ramp_default_mode: %s\n", string_or_none(igniteRampDefaultMode));
@@ -245,6 +261,33 @@ fprintf(fid, "ramp_list_effective_s: %s\n", s_list_to_string(sRamp));
 fprintf(fid, "ramp_list_note: %s\n", sanitize_csv_text(string_or_none(sRampNote)));
 fclose(fid);
 
+% IGNITE_AUDIT: collect and persist audit info before attempting any solve.
+audit = struct();
+audit.enabled = igniteAudit;
+audit.overconstraint_detected = false;
+audit.overconstraint_reason = "none";
+try
+    audit = collect_ignite_audit(model, fromSimDir, ckIn, st, solid, pc, bnd_rigid_top, plateRbmFixRequested, plateRbmFixEffective, plateRbmFixNote, plateRbmFixVtx, dispTopOk, dispTopNote, pressureOk, linearSwitched, linearNote, solverCoupling);
+catch ME
+    audit.enabled = igniteAudit;
+    audit.overconstraint_detected = false;
+    audit.overconstraint_reason = "audit_collect_failed:" + string(ME.message);
+end
+try
+    append_audit_to_summary(summaryPath, audit);
+catch
+end
+try
+    % Write a pre-solve errors.json so audit is available even if a later solve hangs.
+    pre = struct();
+    pre.run_id = runId;
+    pre.exit_status = "AUDIT_PRE";
+    pre.audit = audit;
+    pre.steps = {};
+    write_json(errorsPath, pre);
+catch
+end
+
 budgetS = igniteBudgetS;
 if ~isfinite(budgetS) || budgetS <= 0
     budgetS = inf;
@@ -276,6 +319,23 @@ else
     else
         stagePlan = {'single'};
     end
+end
+
+% IGNITE_AUDIT fail-fast: if we detect over-constraint, do not enter solve at all.
+if igniteAudit && isfield(audit, 'overconstraint_detected') && audit.overconstraint_detected
+    stopReason = "OVERCONSTRAINT_DETECTED";
+    failReason = string_or_none(audit.overconstraint_reason);
+    failStage = "audit";
+    failStepIdx = 1;
+    failS = 1.0;
+    failP = PloadKPa;
+
+    nowIso = datestr(now, 'yyyy-mm-ddTHH:MM:SS');
+    append_metrics_pressure_row(metricsPath, 1, 1.0, PloadKPa, NaN, NaN, NaN, 0, NaN, NaN, "none", false, "FAIL_FAST", char(failReason), 0, ...
+        linearSolverMode, linearSwitched, linearNote, solverCoupling, segDisabled, segNote, fcEnabled, fcMaxIterSet, fcNote, contactMode, contactEffective, contactSupported, contactNote, false, ...
+        runId, "audit", fcMode, fcMaxIterTarget, fcDampedRequested > 0.5, fcDampedEffective, fcLineSearchRequested > 0.5, fcLineSearchEffective, stabilizationRequested > 0.5, stabilizationEffective, budgetS, budgetS - toc(runT0));
+    steps(end+1) = make_step("audit", 1, 1.0, PloadKPa, nowIso, nowIso, 0, "FAIL_FAST", char(failReason), excerpt(string_or_none(failReason), 300), false); %#ok<AGROW>
+    stagePlan = {};
 end
 
 globalStep = 0;
@@ -445,6 +505,7 @@ fprintf(fid, "plate_rbm_fix_requested: %d\n", tern(plateRbmFixRequested, 1, 0));
 fprintf(fid, "plate_rbm_fix_effective: %d\n", tern(plateRbmFixEffective, 1, 0));
 fprintf(fid, "plate_rbm_fix_note: %s\n", sanitize_csv_text(string_or_none(plateRbmFixNote)));
 fprintf(fid, "plate_rbm_fix_vertices: %s\n", sanitize_csv_text(string_or_none(mat2str(plateRbmFixVtx))));
+fprintf(fid, "ignite_audit_mode: %d\n", tern(igniteAudit, 1, 0));
 fprintf(fid, "pressure_load_ok: %d\n", pressureOk);
 fprintf(fid, "solver_coupling: %s\n", sanitize_csv_text(string_or_none(solverCoupling)));
 fprintf(fid, "ignite_ramp_enabled: %d\n", tern(igniteRamp > 0.5, 1, 0));
@@ -540,6 +601,13 @@ try
     payload.contact_mode_effective = char(string_or_none(contactEffective));
     payload.contact_mode_supported = contactSupported;
     payload.contact_mode_note = char(string_or_none(contactNote));
+
+    payload.audit = audit;
+    try
+        payload.overconstraint_detected = tern(isfield(audit,'overconstraint_detected') && audit.overconstraint_detected, true, false);
+        payload.overconstraint_reason = char(string_or_none(getfield(audit,'overconstraint_reason'))); %#ok<GFLD>
+    catch
+    end
 
     payload.steps = steps_to_cell(steps);
 
@@ -1246,6 +1314,255 @@ t = string(t);
 t = replace(t, newline, ' ');
 t = replace(t, char(13), ' ');
 t = replace(t, ',', ';');
+end
+
+function write_json(path, payload)
+txt = jsonencode(payload);
+fid = fopen(path, 'w', 'n', 'UTF-8');
+fprintf(fid, '%s', txt);
+fclose(fid);
+end
+
+function append_audit_to_summary(summaryPath, audit)
+fid = fopen(summaryPath, 'a', 'n', 'UTF-8');
+fprintf(fid, "\nAUDIT_BEGIN\n");
+try
+    fprintf(fid, "audit_timestamp_iso: %s\n", sanitize_csv_text(string_or_none(getfield(audit,'timestamp_iso')))); %#ok<GFLD>
+catch
+end
+
+keys = {'warm_start_enabled','warm_start_useinitsol','warm_start_initmethod','warm_start_initsol', ...
+    'warm_start_source_dir','warm_start_checkpoint_path', ...
+    'disp_top_active','disp_top_direction','disp_top_u0', ...
+    'plate_rbm_fix_requested','plate_rbm_fix_effective','plate_rbm_fix_note','plate_rbm_fix_points', ...
+    'plate_related_features', ...
+    'pressure_boundary_count','pressure_boundary_ids','pressure_expr','pressure_sign', ...
+    'solver_coupling','linear_solver_switched','linear_solver_note', ...
+    'overconstraint_detected','overconstraint_reason'};
+for i = 1:numel(keys)
+    k = keys{i};
+    try
+        v = getfield(audit, k); %#ok<GFLD>
+        if isnumeric(v) || islogical(v)
+            fprintf(fid, "audit_%s: %s\n", k, sanitize_csv_text(string_or_none(mat2str(v))));
+        elseif isstring(v) || ischar(v)
+            fprintf(fid, "audit_%s: %s\n", k, sanitize_csv_text(string_or_none(v)));
+        else
+            fprintf(fid, "audit_%s: %s\n", k, sanitize_csv_text(string_or_none(jsonencode(v))));
+        end
+    catch
+    end
+end
+fprintf(fid, "AUDIT_END\n");
+fclose(fid);
+end
+
+function audit = collect_ignite_audit(model, fromSimDir, ckIn, st, solid, pc, bndRigidTop, plateRbmFixRequested, plateRbmFixEffective, plateRbmFixNote, plateRbmFixPoints, dispTopOk, dispTopNote, pressureOk, linearSwitched, linearNote, solverCoupling)
+audit = struct();
+audit.timestamp_iso = datestr(now, 'yyyy-mm-ddTHH:MM:SS');
+
+audit.warm_start_useinitsol = try_get_string(st, 'useinitsol');
+audit.warm_start_initmethod = try_get_string(st, 'initmethod');
+audit.warm_start_initsol = try_get_string(st, 'initsol');
+audit.warm_start_enabled = strcmpi(strtrim(string_or_none(audit.warm_start_useinitsol)), "on");
+audit.warm_start_source_dir = char(string_or_none(fromSimDir));
+audit.warm_start_checkpoint_path = char(string_or_none(ckIn));
+
+audit.plate_rbm_fix_requested = tern(plateRbmFixRequested, true, false);
+audit.plate_rbm_fix_effective = tern(plateRbmFixEffective, true, false);
+audit.plate_rbm_fix_note = char(string_or_none(plateRbmFixNote));
+audit.plate_rbm_fix_points = plateRbmFixPoints;
+
+audit.solver_coupling = char(string_or_none(solverCoupling));
+audit.linear_solver_switched = tern(linearSwitched, true, false);
+audit.linear_solver_note = char(string_or_none(linearNote));
+
+% Pressure load audit (boundary ids + sign).
+audit.pressure_boundary_ids = bndRigidTop(:)';
+audit.pressure_boundary_count = numel(bndRigidTop);
+audit.pressure_expr = "none";
+audit.pressure_sign = NaN;
+try
+    bndl = solid.feature('bndl1');
+    pexpr = char(bndl.getString('pressure'));
+    audit.pressure_expr = pexpr;
+    s = strtrim(string_or_none(pexpr));
+    if startsWith(s, "-")
+        audit.pressure_sign = -1;
+    elseif startsWith(s, "+")
+        audit.pressure_sign = 1;
+    else
+        audit.pressure_sign = 1;
+    end
+catch
+end
+audit.pressure_load_ok = tern(pressureOk, true, false);
+
+% disp_top audit
+audit.disp_top_ok = tern(dispTopOk, true, false);
+audit.disp_top_note = char(string_or_none(dispTopNote));
+audit.disp_top_active = NaN;
+audit.disp_top_direction = {};
+audit.disp_top_u0 = {};
+try
+    dispTop = solid.feature('disp_top');
+    audit.disp_top_active = try_feature_active(dispTop);
+    audit.disp_top_direction = try_get_string_array(dispTop, 'Direction');
+    audit.disp_top_u0 = try_get_string_array(dispTop, 'U0');
+catch
+end
+
+% Collect plate-related physics features that also select the top boundary.
+plateFeats = {};
+try
+    tags = cellstr(solid.feature.tags);
+    for i = 1:numel(tags)
+        tag = tags{i};
+        f = solid.feature(tag);
+        typ = "?";
+        try, typ = char(f.getType()); catch, end
+
+        ents = [];
+        try
+            ents = f.selection.entities;
+        catch
+            ents = [];
+        end
+
+        overlapN = 0;
+        if ~isempty(ents) && ~isempty(bndRigidTop)
+            try
+                overlapN = numel(intersect(double(ents(:)'), double(bndRigidTop(:)')));
+            catch
+                overlapN = 0;
+            end
+        end
+
+        if overlapN > 0
+            r = struct();
+            r.tag = tag;
+            r.type = typ;
+            r.active = try_feature_active(f);
+            r.overlap_boundary_count = overlapN;
+            plateFeats{end+1} = r; %#ok<AGROW>
+        end
+    end
+catch
+end
+audit.plate_related_features = plateFeats;
+
+% Over-constraint detection: any displacement feature prescribing w on the pressure plate boundary.
+audit.overconstraint_detected = false;
+audit.overconstraint_reason = "none";
+try
+    [over, why] = detect_overconstraint_on_plate(solid, bndRigidTop);
+    audit.overconstraint_detected = over;
+    audit.overconstraint_reason = why;
+catch ME
+    audit.overconstraint_detected = false;
+    audit.overconstraint_reason = "overconstraint_check_failed:" + string(ME.message);
+end
+
+% Record that pc destination exists (selection size), for sanity.
+try
+    audit.pc_destination_boundary_count = numel(pc.destination.entities);
+catch
+end
+end
+
+function [over, why] = detect_overconstraint_on_plate(solid, bndRigidTop)
+over = false;
+why = "none";
+if isempty(bndRigidTop)
+    return;
+end
+tags = cellstr(solid.feature.tags);
+for i = 1:numel(tags)
+    tag = tags{i};
+    f = solid.feature(tag);
+    typ = "";
+    try, typ = string(f.getType()); catch, end
+    if ~contains(lower(typ), "displacement")
+        continue;
+    end
+    active = try_feature_active(f);
+    if ~(islogical(active) && active) && ~(isnumeric(active) && active == 1)
+        continue;
+    end
+    ents = [];
+    try, ents = f.selection.entities; catch, end
+    if isempty(ents)
+        continue;
+    end
+    if isempty(intersect(double(ents(:)'), double(bndRigidTop(:)')))
+        continue;
+    end
+    dir = try_get_string_array(f, 'Direction');
+    if numel(dir) >= 3
+        if ~strcmpi(strtrim(dir{3}), 'free')
+            over = true;
+            why = "z_displacement_prescribed_by_" + string(tag);
+            return;
+        end
+    end
+    u0 = try_get_string_array(f, 'U0');
+    if numel(u0) >= 3
+        if contains(lower(string(u0{3})), "delta")
+            over = true;
+            why = "delta_z_bc_active_" + string(tag);
+            return;
+        end
+    end
+end
+end
+
+function s = try_get_string(obj, key)
+s = "unknown";
+try
+    s = string(obj.getString(key));
+catch
+    try
+        s = string(obj.getString(key));
+    catch
+    end
+end
+end
+
+function c = try_get_string_array(obj, key)
+c = {};
+try
+    a = obj.getStringArray(key);
+    c = java_string_array_to_cell(a);
+catch
+end
+end
+
+function c = java_string_array_to_cell(a)
+c = {};
+try
+    n = numel(a);
+    c = cell(1, n);
+    for i = 1:n
+        c{i} = char(a(i));
+    end
+catch
+    c = {};
+end
+end
+
+function active = try_feature_active(f)
+active = NaN;
+try
+    active = logical(f.isActive());
+    return;
+catch
+end
+try
+    % Some versions expose active() getter with no args.
+    active = logical(f.active());
+    return;
+catch
+end
 end
 
 function [ok, note, vtxPicked] = apply_plate_rbm_fix(model, solid, bndRigidTop)
