@@ -1270,10 +1270,10 @@ end
 
 geomTag = "geom1";
 
-% Find vertices adjacent to top boundary selection (best-effort).
+% Find points adjacent to top boundary selection (best-effort).
 vtx = [];
 try
-    vtx = mphgetadj(model, geomTag, 'boundary', 'vertex', bndRigidTop);
+    vtx = mphgetadj(model, geomTag, 'boundary', 'point', bndRigidTop);
 catch ME
     note = "mphgetadj_failed:" + string(ME.message);
     return;
@@ -1287,7 +1287,7 @@ end
 
 coords = [];
 try
-    coords = mphgetcoords(model, geomTag, 'vertex', vtx);
+    coords = mphgetcoords(model, geomTag, 'point', vtx);
 catch ME
     note = "mphgetcoords_failed:" + string(ME.message);
     return;
