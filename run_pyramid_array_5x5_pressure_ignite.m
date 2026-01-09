@@ -1390,7 +1390,28 @@ function ensure_prescribed_disp_point(solid, tag, vtxId, direction, u0)
 try
     f = solid.feature(tag);
 catch
-    solid.feature.create(tag, 'PrescribedDisplacement', 0);
+    % Prefer using the same displacement feature type as the existing disp_top node (if present).
+    created = false;
+    typeCandidates = {};
+    try
+        if solid.feature().contains('disp_top')
+            typeCandidates{end+1} = char(solid.feature('disp_top').getType()); %#ok<AGROW>
+        end
+    catch
+    end
+    typeCandidates = [typeCandidates, {'Displacement2','Displacement','PrescribedDisplacement'}];
+    for i = 1:numel(typeCandidates)
+        typ = typeCandidates{i};
+        try
+            solid.feature.create(tag, typ, 0);
+            created = true;
+            break;
+        catch
+        end
+    end
+    if ~created
+        error('Unable to create point displacement feature (no supported type among %s).', strjoin(typeCandidates, ','));
+    end
     f = solid.feature(tag);
 end
 f.active(true);
