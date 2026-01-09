@@ -65,6 +65,10 @@ fcMaxIterOverride = numeric_env('SIM_FC_MAXITER', NaN); % backwards-compat overr
 fcDampedRequested = numeric_env('SIM_FC_DAMPED', 0);
 fcLineSearchRequested = numeric_env('SIM_FC_LINESEARCH', 0);
 stabilizationRequested = numeric_env('SIM_SOLVER_STABILIZATION', 0);
+useStationaryPtcRequested = numeric_env('SIM_USE_STATIONARY_PTC', 0) > 0.5;
+ptcMaxSteps = numeric_env('SIM_PTC_MAX_STEPS', 50);
+ptcTimeStep = numeric_env('SIM_PTC_TIME_STEP', 0.1);
+ptcDamping = numeric_env('SIM_PTC_DAMPING', 0.8);
 
 disableSegregated = strcmpi(strtrim(solverCoupling), 'fully_coupled') || strcmpi(strtrim(solverCoupling), 'fully');
 maxSegIter = numeric_env('SIM_MAXSEGITER', 6);
@@ -80,7 +84,7 @@ end
 
 % IGNITE_AUDIT mode: force a single-step attempt (no ramp, no two-stage) and a smaller internal budget.
 auditBudgetS = numeric_env('SIM_IGNITE_AUDIT_BUDGET_S', 300);
-auditFcMaxIter = numeric_env('SIM_IGNITE_AUDIT_FC_MAXITER', 12);
+auditFcMaxIter = numeric_env('SIM_IGNITE_AUDIT_FC_MAXITER', NaN);
 if igniteAudit
     igniteRamp = 0;
     igniteTwoStage = 0;
@@ -104,6 +108,10 @@ fprintf(fid, "linear_solver_mode_requested: %s\n", string(linearSolverMode));
 fprintf(fid, "solver_coupling: %s\n", string(solverCoupling));
 fprintf(fid, "plate_rbm_fix_requested: %d\n", tern(plateRbmFixRequested, 1, 0));
 fprintf(fid, "ignite_audit_mode: %d\n", tern(igniteAudit, 1, 0));
+fprintf(fid, "use_stationary_ptc_requested: %d\n", tern(useStationaryPtcRequested, 1, 0));
+fprintf(fid, "ptc_max_steps: %g\n", ptcMaxSteps);
+fprintf(fid, "ptc_time_step: %g\n", ptcTimeStep);
+fprintf(fid, "ptc_damping: %g\n", ptcDamping);
 fprintf(fid, "ignite_ramp_enabled: %d\n", tern(igniteRamp > 0.5, 1, 0));
 fprintf(fid, "ignite_ramp_list_str: %s\n", string_or_none(igniteRampListStr));
 fprintf(fid, "ignite_ramp_default_mode: %s\n", string_or_none(igniteRampDefaultMode));
@@ -245,6 +253,20 @@ catch ME
     stabilizationNote = string(ME.message);
 end
 
+ptcEffective = false;
+ptcNote = "none";
+ptcMaxStepsSet = NaN;
+ptcTimeStepSet = NaN;
+ptcDampingSet = NaN;
+if useStationaryPtcRequested
+    try
+        [ptcEffective, ptcNote, ptcMaxStepsSet, ptcTimeStepSet, ptcDampingSet] = configure_stationary_ptc_best_effort(model, solverCoupling, ptcMaxSteps, ptcTimeStep, ptcDamping);
+    catch ME
+        ptcEffective = false;
+        ptcNote = "ptc_config_failed:" + string(ME.message);
+    end
+end
+
 % Ensure we actually use initial values from the loaded checkpoint.
 st = model.study('std1').feature('stat');
 try, st.set('initmethod', 'sol'); catch, end
@@ -267,7 +289,7 @@ audit.enabled = igniteAudit;
 audit.overconstraint_detected = false;
 audit.overconstraint_reason = "none";
 try
-    audit = collect_ignite_audit(model, fromSimDir, ckIn, st, solid, pc, bnd_rigid_top, plateRbmFixRequested, plateRbmFixEffective, plateRbmFixNote, plateRbmFixVtx, dispTopOk, dispTopNote, pressureOk, linearSwitched, linearNote, solverCoupling);
+    audit = collect_ignite_audit(model, fromSimDir, ckIn, st, solid, pc, bnd_rigid_top, plateRbmFixRequested, plateRbmFixEffective, plateRbmFixNote, plateRbmFixVtx, dispTopOk, dispTopNote, pressureOk, linearSwitched, linearNote, solverCoupling, useStationaryPtcRequested, ptcEffective, ptcNote, ptcMaxStepsSet, ptcTimeStepSet, ptcDampingSet);
 catch ME
     audit.enabled = igniteAudit;
     audit.overconstraint_detected = false;
@@ -506,6 +528,12 @@ fprintf(fid, "plate_rbm_fix_effective: %d\n", tern(plateRbmFixEffective, 1, 0));
 fprintf(fid, "plate_rbm_fix_note: %s\n", sanitize_csv_text(string_or_none(plateRbmFixNote)));
 fprintf(fid, "plate_rbm_fix_vertices: %s\n", sanitize_csv_text(string_or_none(mat2str(plateRbmFixVtx))));
 fprintf(fid, "ignite_audit_mode: %d\n", tern(igniteAudit, 1, 0));
+fprintf(fid, "use_stationary_ptc_requested: %d\n", tern(useStationaryPtcRequested, 1, 0));
+fprintf(fid, "use_stationary_ptc_effective: %d\n", tern(ptcEffective, 1, 0));
+fprintf(fid, "ptc_note: %s\n", sanitize_csv_text(string_or_none(ptcNote)));
+fprintf(fid, "ptc_max_steps_set: %s\n", num2str(ptcMaxStepsSet));
+fprintf(fid, "ptc_time_step_set: %s\n", num2str(ptcTimeStepSet));
+fprintf(fid, "ptc_damping_set: %s\n", num2str(ptcDampingSet));
 fprintf(fid, "pressure_load_ok: %d\n", pressureOk);
 fprintf(fid, "solver_coupling: %s\n", sanitize_csv_text(string_or_none(solverCoupling)));
 fprintf(fid, "ignite_ramp_enabled: %d\n", tern(igniteRamp > 0.5, 1, 0));
@@ -1336,6 +1364,7 @@ keys = {'warm_start_enabled','warm_start_useinitsol','warm_start_initmethod','wa
     'disp_top_active','disp_top_direction','disp_top_u0', ...
     'plate_rbm_fix_requested','plate_rbm_fix_effective','plate_rbm_fix_note','plate_rbm_fix_points', ...
     'plate_related_features', ...
+    'use_stationary_ptc_requested','use_stationary_ptc_effective','ptc_note','ptc_max_steps_set','ptc_time_step_set','ptc_damping_set', ...
     'pressure_boundary_count','pressure_boundary_ids','pressure_expr','pressure_sign', ...
     'solver_coupling','linear_solver_switched','linear_solver_note', ...
     'overconstraint_detected','overconstraint_reason'};
@@ -1357,7 +1386,7 @@ fprintf(fid, "AUDIT_END\n");
 fclose(fid);
 end
 
-function audit = collect_ignite_audit(model, fromSimDir, ckIn, st, solid, pc, bndRigidTop, plateRbmFixRequested, plateRbmFixEffective, plateRbmFixNote, plateRbmFixPoints, dispTopOk, dispTopNote, pressureOk, linearSwitched, linearNote, solverCoupling)
+function audit = collect_ignite_audit(model, fromSimDir, ckIn, st, solid, pc, bndRigidTop, plateRbmFixRequested, plateRbmFixEffective, plateRbmFixNote, plateRbmFixPoints, dispTopOk, dispTopNote, pressureOk, linearSwitched, linearNote, solverCoupling, useStationaryPtcRequested, ptcEffective, ptcNote, ptcMaxStepsSet, ptcTimeStepSet, ptcDampingSet)
 audit = struct();
 audit.timestamp_iso = datestr(now, 'yyyy-mm-ddTHH:MM:SS');
 
@@ -1376,6 +1405,13 @@ audit.plate_rbm_fix_points = plateRbmFixPoints;
 audit.solver_coupling = char(string_or_none(solverCoupling));
 audit.linear_solver_switched = tern(linearSwitched, true, false);
 audit.linear_solver_note = char(string_or_none(linearNote));
+
+audit.use_stationary_ptc_requested = tern(useStationaryPtcRequested, true, false);
+audit.use_stationary_ptc_effective = tern(ptcEffective, true, false);
+audit.ptc_note = char(string_or_none(ptcNote));
+audit.ptc_max_steps_set = ptcMaxStepsSet;
+audit.ptc_time_step_set = ptcTimeStepSet;
+audit.ptc_damping_set = ptcDampingSet;
 
 % Pressure load audit (boundary ids + sign).
 audit.pressure_boundary_ids = bndRigidTop(:)';
@@ -1467,6 +1503,79 @@ end
 try
     audit.pc_destination_boundary_count = numel(pc.destination.entities);
 catch
+end
+end
+
+function [ptcOk, note, maxStepsSet, timeStepSet, dampingSet] = configure_stationary_ptc_best_effort(model, solverCoupling, maxSteps, timeStep, damping)
+%CONFIGURE_STATIONARY_PTC_BEST_EFFORT Enable pseudo time stepping for stationary fully-coupled solver (best-effort).
+% COMSOL exposes pseudo time stepping knobs on the FullyCoupled node (fc1) in this model version.
+
+ptcOk = false;
+note = "none";
+maxStepsSet = NaN;
+timeStepSet = NaN;
+dampingSet = NaN;
+
+if ~strcmpi(strtrim(string_or_none(solverCoupling)), "fully_coupled")
+    note = "ptc_requires_fully_coupled";
+    return;
+end
+
+try
+    s = model.sol('sol1').feature('s1');
+catch
+    note = "missing_sol1_s1";
+    return;
+end
+
+% Ensure fc1 exists (configure_solver_coupling typically creates it).
+try
+    fc = s.feature('fc1');
+catch
+    try
+        s.feature.create('fc1', 'FullyCoupled');
+        fc = s.feature('fc1');
+    catch ME
+        note = "missing_fc1:" + string(ME.message);
+        return;
+    end
+end
+
+% Apply conservative pseudo time stepping knobs that exist on fc1.
+okAny = false;
+try
+    % niter behaves like a pseudo-step cap for the fc node in this COMSOL build.
+    if isfinite(maxSteps) && maxSteps > 0
+        try, fc.set('niter', maxSteps); okAny = true; maxStepsSet = maxSteps; catch, end
+    end
+
+    % initsteph/minsteph behave like pseudo-step sizes (best-effort).
+    if isfinite(timeStep) && timeStep > 0
+        try, fc.set('initsteph', timeStep); okAny = true; timeStepSet = timeStep; catch, end
+        try, fc.set('minsteph', max(timeStep/1e4, 1e-12)); okAny = true; catch, end
+    end
+
+    % Map damping to solver damping caps if present.
+    if isfinite(damping) && damping > 0 && damping <= 1.0
+        try, fc.set('etamax', damping); okAny = true; dampingSet = damping; catch, end
+        try, fc.set('maxdamp', damping); okAny = true; dampingSet = damping; catch, end
+        try, fc.set('mindamp', min(0.1, damping/2)); okAny = true; catch, end
+    end
+
+    % Ensure CFL adaptation is enabled (commonly used by pseudo time stepping).
+    try, fc.set('forcecfl', 'on'); okAny = true; catch, end
+    try, fc.set('adaptcfltol', 'on'); okAny = true; catch, end
+catch ME
+    note = "ptc_set_failed:" + string(ME.message);
+    ptcOk = false;
+    return;
+end
+
+ptcOk = okAny;
+if ptcOk
+    note = "ptc_props_set_on_fc1";
+else
+    note = "ptc_no_supported_props";
 end
 end
 
