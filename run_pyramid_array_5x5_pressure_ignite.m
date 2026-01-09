@@ -50,6 +50,7 @@ contactMode = get_env_or_default('PHASE2_CONTACT_MODE', 'augmented_lagrange');
 linearSolverMode = get_env_or_default('SIM_LINEAR_SOLVER_MODE', 'direct_pardiso');
 solverCoupling = get_env_or_default('SIM_SOLVER_COUPLING', 'segregated');
 igniteRamp = numeric_env('SIM_IGNITE_RAMP', 0);
+plateRbmFixRequested = numeric_env('SIM_PLATE_RBM_FIX', 1) > 0.5;
 
 igniteRampListStr = get_env_or_default('SIM_IGNITE_RAMP_LIST', '');
 igniteRampDefaultMode = get_env_or_default('SIM_IGNITE_RAMP_DEFAULT_MODE', 'legacy');
@@ -86,6 +87,7 @@ fprintf(fid, "P_load_kPa: %.6g\n", PloadKPa);
 fprintf(fid, "contact_mode_requested: %s\n", string(contactMode));
 fprintf(fid, "linear_solver_mode_requested: %s\n", string(linearSolverMode));
 fprintf(fid, "solver_coupling: %s\n", string(solverCoupling));
+fprintf(fid, "plate_rbm_fix_requested: %d\n", tern(plateRbmFixRequested, 1, 0));
 fprintf(fid, "ignite_ramp_enabled: %d\n", tern(igniteRamp > 0.5, 1, 0));
 fprintf(fid, "ignite_ramp_list_str: %s\n", string_or_none(igniteRampListStr));
 fprintf(fid, "ignite_ramp_default_mode: %s\n", string_or_none(igniteRampDefaultMode));
@@ -139,15 +141,43 @@ end
 bnd_rigid_top = solid.feature('bndl1').selection.entities;
 bnd_eval = pc.destination.entities;
 
-% Disable displacement-control in z (avoid over-constraint) but keep x/y fixed.
+% Plate rigid-body-mode suppression (minimal modeling fix) for pressure-control ignite:
+% Prefer point-based constraints (x/y only) vs constraining x/y over the whole top boundary.
+plateRbmFixEffective = false;
+plateRbmFixNote = "none";
+plateRbmFixVtx = [];
 dispTopOk = false;
-try
-    solid.feature('disp_top').active(true);
-    solid.feature('disp_top').selection.set(bnd_rigid_top);
-    solid.feature('disp_top').set('Direction', {'prescribed','prescribed','free'});
-    solid.feature('disp_top').set('U0', {'0','0','0'});
+dispTopNote = "none";
+if plateRbmFixRequested
+    try
+        [plateRbmFixEffective, plateRbmFixNote, plateRbmFixVtx] = apply_plate_rbm_fix(model, solid, bnd_rigid_top);
+    catch ME
+        plateRbmFixEffective = false;
+        plateRbmFixNote = string(ME.message);
+        plateRbmFixVtx = [];
+    end
+end
+
+% Displacement-control: ensure z is free (avoid over-constraint). If RBM fix is effective, disable disp_top.
+if plateRbmFixEffective
+    try
+        solid.feature('disp_top').active(false);
+    catch
+    end
     dispTopOk = true;
-catch
+    dispTopNote = "disp_top_disabled_due_to_plate_rbm_fix";
+else
+    try
+        solid.feature('disp_top').active(true);
+        solid.feature('disp_top').selection.set(bnd_rigid_top);
+        solid.feature('disp_top').set('Direction', {'prescribed','prescribed','free'});
+        solid.feature('disp_top').set('U0', {'0','0','0'});
+        dispTopOk = true;
+        dispTopNote = "disp_top_xy_prescribed";
+    catch ME
+        dispTopOk = false;
+        dispTopNote = string(ME.message);
+    end
 end
 
 % Apply pressure load in -z via P_load parameter.
@@ -410,6 +440,11 @@ fprintf(fid, "\nsummary_stage: END\n");
 fprintf(fid, "dcnt1_only_ok: %d\n", dcntOnlyOk);
 fprintf(fid, "dcnt1_only_note: %s\n", sanitize_csv_text(string_or_none(dcntOnlyNote)));
 fprintf(fid, "disp_top_xy_only_ok: %d\n", dispTopOk);
+fprintf(fid, "disp_top_note: %s\n", sanitize_csv_text(string_or_none(dispTopNote)));
+fprintf(fid, "plate_rbm_fix_requested: %d\n", tern(plateRbmFixRequested, 1, 0));
+fprintf(fid, "plate_rbm_fix_effective: %d\n", tern(plateRbmFixEffective, 1, 0));
+fprintf(fid, "plate_rbm_fix_note: %s\n", sanitize_csv_text(string_or_none(plateRbmFixNote)));
+fprintf(fid, "plate_rbm_fix_vertices: %s\n", sanitize_csv_text(string_or_none(mat2str(plateRbmFixVtx))));
 fprintf(fid, "pressure_load_ok: %d\n", pressureOk);
 fprintf(fid, "solver_coupling: %s\n", sanitize_csv_text(string_or_none(solverCoupling)));
 fprintf(fid, "ignite_ramp_enabled: %d\n", tern(igniteRamp > 0.5, 1, 0));
@@ -1211,4 +1246,142 @@ t = string(t);
 t = replace(t, newline, ' ');
 t = replace(t, char(13), ' ');
 t = replace(t, ',', ';');
+end
+
+function [ok, note, vtxPicked] = apply_plate_rbm_fix(model, solid, bndRigidTop)
+%APPLY_PLATE_RBM_FIX Minimal rigid-body-mode suppression for pressure plate:
+% - select 3 top-plane vertices adjacent to the pressure boundary
+% - constrain:
+%   v1: x=0, y=0 (reference)
+%   v2: x=0 (remove in-plane rotation about z)
+%   v3: y=0 (remove in-plane rotation about z)
+% - never constrain z here
+%
+% If vertex selection or feature creation is unsupported, return ok=false with reason.
+
+ok = false;
+note = "none";
+vtxPicked = [];
+
+if isempty(bndRigidTop)
+    note = "bndRigidTop_empty";
+    return;
+end
+
+geomTag = "geom1";
+
+% Find vertices adjacent to top boundary selection (best-effort).
+vtx = [];
+try
+    vtx = mphgetadj(model, geomTag, 'boundary', 'vertex', bndRigidTop);
+catch ME
+    note = "mphgetadj_failed:" + string(ME.message);
+    return;
+end
+
+vtx = unique(vtx(:)');
+if isempty(vtx)
+    note = "no_vertices_adjacent";
+    return;
+end
+
+coords = [];
+try
+    coords = mphgetcoords(model, geomTag, 'vertex', vtx);
+catch ME
+    note = "mphgetcoords_failed:" + string(ME.message);
+    return;
+end
+
+% Expect coords as 3xN (x;y;z). Handle transposed cases.
+if size(coords, 1) ~= 3 && size(coords, 2) == 3
+    coords = coords.';
+end
+if size(coords, 1) ~= 3
+    note = "unexpected_coords_shape:" + string(mat2str(size(coords)));
+    return;
+end
+
+x = coords(1, :);
+y = coords(2, :);
+z = coords(3, :);
+
+zTop = max(z);
+zTol = 1e-9; % 1 nm in meters; robust enough for planar top surface
+topMask = abs(z - zTop) <= zTol;
+if ~any(topMask)
+    % Fall back: take all vertices if we can't identify top plane.
+    topMask = true(size(z));
+end
+
+vtxTop = vtx(topMask);
+xTop = x(topMask);
+yTop = y(topMask);
+
+% Pick v1 near (xmin,ymin), v2 near (xmax,ymin), v3 near (xmin,ymax).
+[xmin, ~] = min(xTop);
+[xmax, ~] = max(xTop);
+[ymin, ~] = min(yTop);
+[ymax, ~] = max(yTop);
+
+dist2 = @(xx, yy, x0, y0) (xx - x0).^2 + (yy - y0).^2;
+
+[~, i1] = min(dist2(xTop, yTop, xmin, ymin));
+[~, i2] = min(dist2(xTop, yTop, xmax, ymin));
+[~, i3] = min(dist2(xTop, yTop, xmin, ymax));
+
+v1 = vtxTop(i1);
+v2 = vtxTop(i2);
+v3 = vtxTop(i3);
+
+vtxPicked = [v1, v2, v3];
+vtxPicked = unique(vtxPicked, 'stable');
+
+if numel(vtxPicked) < 2
+    note = "insufficient_unique_vertices";
+    return;
+end
+
+% Create/enable point-wise prescribed displacement features.
+try
+    % v1: x,y fixed
+    tag1 = "disp_plate_rbm_ref";
+    ensure_prescribed_disp_point(solid, tag1, v1, {'prescribed','prescribed','free'}, {'0','0','0'});
+
+    if numel(vtxPicked) >= 2
+        % v2: x fixed
+        tag2 = "disp_plate_rbm_x";
+        ensure_prescribed_disp_point(solid, tag2, v2, {'prescribed','free','free'}, {'0','0','0'});
+    end
+    if numel(vtxPicked) >= 3
+        % v3: y fixed
+        tag3 = "disp_plate_rbm_y";
+        ensure_prescribed_disp_point(solid, tag3, v3, {'free','prescribed','free'}, {'0','0','0'});
+    end
+catch ME
+    ok = false;
+    note = "create_point_disp_failed:" + string(ME.message);
+    return;
+end
+
+ok = true;
+note = "point_constraints_applied";
+end
+
+function ensure_prescribed_disp_point(solid, tag, vtxId, direction, u0)
+%ENSURE_PRESCRIBED_DISP_POINT Ensure a point prescribed displacement exists and is configured.
+%
+% COMSOL feature types vary by version; we only use PrescribedDisplacement and fail
+% gracefully to caller if creation isn't supported.
+
+try
+    f = solid.feature(tag);
+catch
+    solid.feature.create(tag, 'PrescribedDisplacement', 0);
+    f = solid.feature(tag);
+end
+f.active(true);
+f.selection.set(vtxId);
+try, f.set('Direction', direction); catch, end
+try, f.set('U0', u0); catch, end
 end
