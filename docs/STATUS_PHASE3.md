@@ -160,6 +160,33 @@ Artifacts (audit):
 - `out/pyramid_5x5/pressure_ignite_20260109_104553/summary.txt`
 - `out/pyramid_5x5/pressure_ignite_20260109_104553/metrics_pressure.csv`
 - `out/pyramid_5x5/pressure_ignite_20260109_104553/errors.json`
+
+---
+
+## Update (2026-01-09) — Pressure ignite-v3 with plate RBM suppression attempt (watchdog kill)
+
+Goal:
+- Apply the **minimal modeling fix** “plate rigid body mode suppression” for pressure control, then re-run ignite-v3 and check whether we can obtain at least one SUCCESS checkpoint.
+
+Run:
+- Output dir: `out/pyramid_5x5/pressure_ignite_20260109_125630/`
+- Config: same as prior ignite-v3 run (FullyCoupled + robust + PARDISO, two-stage, ramp list `1.0,0.6,0.3`, internal budget 1500s, watchdog 1800s).
+
+Observed:
+- stage=single at `P_load_kPa=1.0`: returned **FAIL** after `~829s` (max Newton iterations; relative error `~0.026`).
+- stage=ramp at `P_load_kPa=0.6`: **STARTED** but did **not return** before watchdog.
+- Watchdog kill occurred:
+  - `exit_status=KILLED_BY_WATCHDOG`
+  - `killed_at_iso=2026-01-09T13:25:41`
+
+Artifacts:
+- `out/pyramid_5x5/pressure_ignite_20260109_125630/summary.txt` contains `StepStart/StepEnd` for stage=single and the `WatchdogKill` footer.
+- `out/pyramid_5x5/pressure_ignite_20260109_125630/metrics_pressure.csv` contains the single step row for `P_load_kPa=1.0` (FAIL).
+- `out/pyramid_5x5/pressure_ignite_20260109_125630/errors.json` contains the kill terminal state.
+
+Conclusion:
+- This run did not produce a checkpoint and also shows a **non-deterministic stall** (solve did not return) on the `0.6 kPa` step within the watchdog wall clock.
+- Next action (solver-only, minimal): add a per-step abort mechanism (e.g., COMSOL `ModelUtil.abort` timer) or split steps into per-step watchdog processes so failures return deterministically without relying on the global kill.
 - watchdog timeout kill at 900s:
   - `out/pyramid_5x5/sim_20260108_131902/watchdog_heartbeat.txt` ends with `KILLED ... attempt_mode=PTC`
   - `out/pyramid_5x5/sim_20260108_131902/fallback_report.json` stayed at `status=STARTED`
