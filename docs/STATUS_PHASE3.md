@@ -118,6 +118,48 @@ This confirms the previous “dcnt1 undefined” issue was a **variable-name mis
 Attempted mechanical regression (PTC-only, from last_success=1.0230):
 - `out/pyramid_5x5/sim_20260108_131902/`
 - target: `1.02301`
+
+---
+
+## Update (2026-01-09) — Pressure-control ignite-v3 (30 min budgeted run)
+
+Goal:
+- Try to obtain at least one **pressure-control SUCCESS checkpoint** (or a clear, reproducible FAIL classification) using **solver-only** robustness knobs (no physics changes).
+
+Run:
+- Output dir: `out/pyramid_5x5/pressure_ignite_20260109_104553/`
+- Inputs:
+  - initial values from: `out/pyramid_5x5/sim_20260107_152913/Pyramid_5x5_checkpoint_last_ok.mph`
+  - `ContactMode=augmented_lagrange`
+  - `SolverCoupling=fully_coupled`
+  - `LinearSolverMode=direct_pardiso` (switch confirmed)
+  - `IgniteTwoStage=1`
+  - `IgniteRamp=1`
+  - `IgniteRampList="1.0,0.6,0.3"` (interpreted as **kPa** because `PloadKPa=1.0`)
+  - `FcMode=robust`, `FcDamped=1`, `FcLineSearch=1`, `SolverStabilization=1`
+  - internal `IgniteBudgetSec=1500`, external watchdog `TimeoutSec=1800`
+
+Result:
+- `exit_status=FAIL`
+- No `checkpoint_last_ok.mph` produced (`checkpoint_last_ok_exists: 0`)
+- Steps attempted (fail-fast on first ramp failure):
+  - stage=single, `P_load_kPa=1.0`: **FAIL** (reached max Newton iterations)
+  - stage=ramp, `P_load_kPa=0.6`: **FAIL** (reached max Newton iterations)
+  - `P_load_kPa=0.3` not attempted due to fail-fast
+- Budget: `budget_used_s ≈ 826.9 / 1500`
+
+Failure classification (clear + reproducible):
+- **Nonlinear nonconvergence (max Newton iterations)** in `sol1/s1` with additional solver message “linear solver has error message”.
+
+Minimal next actions (modeling-level, smallest changes likely to help):
+- Add rigid-body mode suppression for the pressure plate (e.g., explicitly constrain remaining rigid DOFs, or add weak springs/penalty regularization for rotation/translation) to avoid near-singular states under pure pressure load.
+- Try “preload then switch” workflow: keep a tiny displacement pre-compression (or keep contact established) then switch to pressure control (helps avoid starting from under-contact / ill-conditioned regime).
+- If convergence still stalls: increase `fc_maxiter_target` (robust) and/or insert intermediate pressure steps closer to the failing point (e.g. `1.0 → 0.8 → 0.6`) while keeping fail-fast per-step.
+
+Artifacts (audit):
+- `out/pyramid_5x5/pressure_ignite_20260109_104553/summary.txt`
+- `out/pyramid_5x5/pressure_ignite_20260109_104553/metrics_pressure.csv`
+- `out/pyramid_5x5/pressure_ignite_20260109_104553/errors.json`
 - watchdog timeout kill at 900s:
   - `out/pyramid_5x5/sim_20260108_131902/watchdog_heartbeat.txt` ends with `KILLED ... attempt_mode=PTC`
   - `out/pyramid_5x5/sim_20260108_131902/fallback_report.json` stayed at `status=STARTED`
