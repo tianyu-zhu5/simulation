@@ -1251,10 +1251,10 @@ end
 function [ok, note, vtxPicked] = apply_plate_rbm_fix(model, solid, bndRigidTop)
 %APPLY_PLATE_RBM_FIX Minimal rigid-body-mode suppression for pressure plate:
 % - select 3 top-plane vertices adjacent to the pressure boundary
-% - constrain:
-%   v1: x=0, y=0 (reference)
-%   v2: x=0 (remove in-plane rotation about z)
-%   v3: y=0 (remove in-plane rotation about z)
+% - constrain (pointwise constraints, user-defined):
+%   v1: u=0, v=0 (reference translations)
+%   v2: u=0 (helps remove in-plane rotation about z)
+%   v3: v=0 (helps remove in-plane rotation about z)
 % - never constrain z here
 %
 % If vertex selection or feature creation is unsupported, return ok=false with reason.
@@ -1355,21 +1355,19 @@ if numel(vtxPicked) < 2
     return;
 end
 
-% Create/enable point-wise prescribed displacement features.
+% Create/enable point-wise constraints (dim 0).
+% For this model/COMSOL version, 'Displacement2' cannot be created at Edim=0,
+% but 'PointwiseConstraint' can, and supports a user-defined constraint expression.
 try
-    % v1: x,y fixed
-    tag1 = "disp_plate_rbm_ref";
-    ensure_prescribed_disp_point(solid, tag1, v1, {'prescribed','prescribed','free'}, {'0','0','0'});
+    % v1: u=0, v=0
+    ensure_pointwise_constraint(solid, "pc_plate_rbm_u_ref", v1, "solid.u");
+    ensure_pointwise_constraint(solid, "pc_plate_rbm_v_ref", v1, "solid.v");
 
     if numel(vtxPicked) >= 2
-        % v2: x fixed
-        tag2 = "disp_plate_rbm_x";
-        ensure_prescribed_disp_point(solid, tag2, v2, {'prescribed','free','free'}, {'0','0','0'});
+        ensure_pointwise_constraint(solid, "pc_plate_rbm_u_aux", v2, "solid.u");
     end
     if numel(vtxPicked) >= 3
-        % v3: y fixed
-        tag3 = "disp_plate_rbm_y";
-        ensure_prescribed_disp_point(solid, tag3, v3, {'free','prescribed','free'}, {'0','0','0'});
+        ensure_pointwise_constraint(solid, "pc_plate_rbm_v_aux", v3, "solid.v");
     end
 catch ME
     ok = false;
@@ -1378,44 +1376,20 @@ catch ME
 end
 
 ok = true;
-note = "point_constraints_applied";
+note = "point_constraints_applied_n=" + string(numel(vtxPicked));
 end
 
-function ensure_prescribed_disp_point(solid, tag, vtxId, direction, u0)
-%ENSURE_PRESCRIBED_DISP_POINT Ensure a point prescribed displacement exists and is configured.
-%
-% COMSOL feature types vary by version; we only use PrescribedDisplacement and fail
-% gracefully to caller if creation isn't supported.
-
+function ensure_pointwise_constraint(solid, tag, pointId, expr)
+%ENSURE_POINTWISE_CONSTRAINT Creates/enables a PointwiseConstraint at Edim=0 and sets a user-defined constraint.
 try
     f = solid.feature(tag);
 catch
-    % Prefer using the same displacement feature type as the existing disp_top node (if present).
-    created = false;
-    typeCandidates = {};
-    try
-        if solid.feature().contains('disp_top')
-            typeCandidates{end+1} = char(solid.feature('disp_top').getType()); %#ok<AGROW>
-        end
-    catch
-    end
-    typeCandidates = [typeCandidates, {'Displacement2','Displacement','PrescribedDisplacement'}];
-    for i = 1:numel(typeCandidates)
-        typ = typeCandidates{i};
-        try
-            solid.feature.create(tag, typ, 0);
-            created = true;
-            break;
-        catch
-        end
-    end
-    if ~created
-        error('Unable to create point displacement feature (no supported type among %s).', strjoin(typeCandidates, ','));
-    end
+    solid.feature.create(tag, 'PointwiseConstraint', 0);
     f = solid.feature(tag);
 end
 f.active(true);
-f.selection.set(vtxId);
-try, f.set('Direction', direction); catch, end
-try, f.set('U0', u0); catch, end
+f.selection.set(pointId);
+try, f.set('constraintType', 'userDefined'); catch, end
+try, f.set('constraintExpression', expr); catch, end
+try, f.set('constraintForce', '0'); catch, end
 end
