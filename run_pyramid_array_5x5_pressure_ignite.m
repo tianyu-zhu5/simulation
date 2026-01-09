@@ -1415,7 +1415,7 @@ end
 % Collect plate-related physics features that also select the top boundary.
 plateFeats = {};
 try
-    tags = cellstr(solid.feature.tags);
+    tags = java_string_array_to_cell(solid.feature.tags);
     for i = 1:numel(tags)
         tag = tags{i};
         f = solid.feature(tag);
@@ -1476,7 +1476,7 @@ why = "none";
 if isempty(bndRigidTop)
     return;
 end
-tags = cellstr(solid.feature.tags);
+tags = java_string_array_to_cell(solid.feature.tags);
 for i = 1:numel(tags)
     tag = tags{i};
     f = solid.feature(tag);
